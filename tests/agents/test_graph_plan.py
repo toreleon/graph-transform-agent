@@ -76,6 +76,7 @@ def test_graphplan_config_defaults():
     )
     assert config.max_explore_steps == 30
     assert config.max_plan_revisions == 3
+    assert config.max_test_retries == 2
 
 
 def test_ready_to_plan_pattern():
@@ -653,3 +654,614 @@ def test_build_graph_dispatch_python():
         assert "Foo" in names
     finally:
         os.unlink(py_path)
+
+
+# ============================================================
+# 7-Layer Verification System Tests
+# ============================================================
+
+
+def _run_verify(ns, plan, graph, tmpfiles=None):
+    """Run verify_plan and return parsed result dict.
+
+    Args:
+        ns: Helper namespace from _get_helper_ns()
+        plan: List of plan step dicts
+        graph: Graph dict with symbols/imports/line_kinds
+        tmpfiles: Optional dict mapping logical file paths to temp file paths
+                  for rewriting plan file references
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    # Rewrite file paths in plan if tmpfiles provided
+    if tmpfiles:
+        for step in plan:
+            fp = step.get("params", {}).get("file", "")
+            if fp in tmpfiles:
+                step["params"]["file"] = tmpfiles[fp]
+
+    captured = io.StringIO()
+    with redirect_stdout(captured):
+        ns["verify_plan"](json.dumps(plan), json.dumps(graph))
+    return json.loads(captured.getvalue().strip())
+
+
+# --- Helper Function Tests ---
+
+
+def test_fuzzy_find_close_match():
+    """Test _fuzzy_find returns high similarity for close matches."""
+    ns = _get_helper_ns()
+    fuzzy = ns["_fuzzy_find"]
+
+    content = "def calculate_total(items):\n    return sum(items)\n"
+    pattern = "def calculate_totl(items):\n    return sum(items)\n"  # typo
+    ratio, matched = fuzzy(content, pattern)
+    assert ratio > 0.8
+    assert matched is not None
+
+
+def test_fuzzy_find_no_match():
+    """Test _fuzzy_find returns 0.0 for completely different content."""
+    ns = _get_helper_ns()
+    fuzzy = ns["_fuzzy_find"]
+
+    content = "class Foo:\n    pass\n"
+    pattern = "function bar() { return 42; }"
+    ratio, matched = fuzzy(content, pattern)
+    assert ratio == 0.0
+    assert matched is None
+
+
+def test_fuzzy_find_empty():
+    """Test _fuzzy_find handles empty inputs."""
+    ns = _get_helper_ns()
+    fuzzy = ns["_fuzzy_find"]
+
+    assert fuzzy("", "pattern") == (0.0, None)
+    assert fuzzy("content", "") == (0.0, None)
+
+
+def test_extract_method_name_python():
+    """Test _extract_method_name with Python def."""
+    ns = _get_helper_ns()
+    extract = ns["_extract_method_name"]
+
+    assert extract("    def foo(self):") == "foo"
+    assert extract("def bar(x, y):") == "bar"
+    assert extract("    async def baz(self):") == "baz"
+
+
+def test_extract_method_name_js():
+    """Test _extract_method_name with JavaScript function."""
+    ns = _get_helper_ns()
+    extract = ns["_extract_method_name"]
+
+    assert extract("function render() {") == "render"
+    assert extract("async function fetchData() {") == "fetchData"
+
+
+def test_extract_method_name_general():
+    """Test _extract_method_name with general identifier(."""
+    ns = _get_helper_ns()
+    extract = ns["_extract_method_name"]
+
+    assert extract("    render() {") == "render"
+    assert extract(None) is None
+    assert extract("") is None
+
+
+def test_syntax_check_content_valid():
+    """Test _syntax_check_content with valid Python."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+    check = ns["_syntax_check_content"]
+
+    ok, err = check("def foo():\n    return 42\n", "test.py")
+    assert ok is True
+    assert err is None
+
+
+def test_syntax_check_content_invalid():
+    """Test _syntax_check_content with broken Python."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+    check = ns["_syntax_check_content"]
+
+    ok, err = check("def foo(\n", "test.py")
+    assert ok is False
+    assert "syntax error" in err.lower() or "Replacement" in err
+
+
+def test_syntax_check_content_no_treesitter():
+    """Test _syntax_check_content degrades gracefully without tree-sitter."""
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = False
+    check = ns["_syntax_check_content"]
+
+    ok, err = check("def foo(\n", "test.py")
+    assert ok is True
+    assert err is None
+
+
+# --- Layer 1 Tests ---
+
+
+def test_verify_pattern_exists():
+    """Layer 1: Pattern found in file -> no error."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello():\n    return 'world'\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "replace_code", "params": {
+            "file": tmp, "pattern": "return 'world'", "replacement": "return 'hello'"
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert result["passed"] is True
+        assert len(result["errors"]) == 0
+    finally:
+        os.unlink(tmp)
+
+
+def test_verify_pattern_not_found():
+    """Layer 1: Pattern missing from file -> error."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello():\n    return 'world'\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "replace_code", "params": {
+            "file": tmp, "pattern": "nonexistent_pattern", "replacement": "new_code"
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert result["passed"] is False
+        assert any("not found" in e.lower() or "Pattern" in e for e in result["errors"])
+    finally:
+        os.unlink(tmp)
+
+
+def test_verify_pattern_fuzzy_match():
+    """Layer 1: Close but not exact pattern -> warning with similarity."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def calculate_total(items):\n    return sum(items)\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "replace_code", "params": {
+            "file": tmp,
+            "pattern": "def calculate_totl(items):\n    return sum(items)\n",
+            "replacement": "def calc(items):\n    return sum(items)\n",
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        # Should have a warning about fuzzy match (not an error since it's close enough)
+        assert len(result["warnings"]) > 0
+        assert any("similar" in w.lower() for w in result["warnings"])
+    finally:
+        os.unlink(tmp)
+
+
+def test_verify_old_signature_not_found():
+    """Layer 1: modify_function_signature old_sig missing -> error."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def foo(x):\n    return x\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "modify_function_signature", "params": {
+            "file": tmp, "func_name": "foo",
+            "old_signature": "def foo(y)", "new_signature": "def foo(x, y)"
+        }}]
+        graph = {"symbols": [{"name": "foo", "kind": "function", "file": tmp,
+                              "start_line": 1, "end_line": 2}],
+                 "imports": [], "line_kinds": {}}
+        result = _run_verify(ns, plan, graph)
+        assert result["passed"] is False
+        assert any("signature" in e.lower() or "not found" in e.lower() for e in result["errors"])
+    finally:
+        os.unlink(tmp)
+
+
+def test_verify_import_duplicate():
+    """Layer 1: Import already present -> warning."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("import os\nimport sys\n\ndef foo():\n    pass\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "add_import", "params": {
+            "file": tmp, "import_statement": "import os"
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert result["passed"] is True  # Warning, not error
+        assert len(result["warnings"]) > 0
+        assert any("already exists" in w.lower() or "import" in w.lower() for w in result["warnings"])
+    finally:
+        os.unlink(tmp)
+
+
+def test_verify_method_duplicate():
+    """Layer 1: Method name exists in file -> warning."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("class MyClass:\n    def render(self):\n        pass\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "add_method", "params": {
+            "file": tmp, "class_name": "MyClass",
+            "method_code": "    def render(self):\n        return None"
+        }}]
+        graph = {"symbols": [{"name": "MyClass", "kind": "class", "file": tmp,
+                              "start_line": 1, "end_line": 3}],
+                 "imports": [], "line_kinds": {}}
+        result = _run_verify(ns, plan, graph)
+        assert result["passed"] is True  # Warning, not error
+        assert len(result["warnings"]) > 0
+        assert any("render" in w and "already exist" in w.lower() for w in result["warnings"])
+    finally:
+        os.unlink(tmp)
+
+
+def test_verify_rename_name_not_found():
+    """Layer 1: old_name not in file -> error."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def foo():\n    return 42\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "rename_symbol", "params": {
+            "file": tmp, "old_name": "nonexistent_var", "new_name": "new_var"
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert result["passed"] is False
+        assert any("not found" in e.lower() for e in result["errors"])
+    finally:
+        os.unlink(tmp)
+
+
+# --- Layer 2 Tests ---
+
+
+def test_line_drift_insert_then_delete():
+    """Layer 2: Insert before delete on same file -> warning with drift amount."""
+    ns = _get_helper_ns()
+    drift_check = ns["_check_line_drift"]
+
+    plan = [
+        {"op": "insert_code", "params": {"file": "test.py", "anchor_line": 5, "position": "after", "code": "x = 1\ny = 2"}},
+        {"op": "delete_lines", "params": {"file": "test.py", "start_line": 10, "end_line": 12}},
+    ]
+    warnings = drift_check(plan)
+    assert len(warnings) > 0
+    assert any("off by" in w for w in warnings)
+
+
+def test_line_drift_no_drift():
+    """Layer 2: Only replace_code with same-size replacement -> no drift warning."""
+    ns = _get_helper_ns()
+    drift_check = ns["_check_line_drift"]
+
+    plan = [
+        {"op": "replace_code", "params": {"file": "test.py", "pattern": "old_line", "replacement": "new_line"}},
+        {"op": "replace_code", "params": {"file": "test.py", "pattern": "another_old", "replacement": "another_new"}},
+    ]
+    warnings = drift_check(plan)
+    assert len(warnings) == 0
+
+
+def test_line_drift_multi_file():
+    """Layer 2: Operations on different files -> no cross-file drift."""
+    ns = _get_helper_ns()
+    drift_check = ns["_check_line_drift"]
+
+    plan = [
+        {"op": "insert_code", "params": {"file": "a.py", "anchor_line": 5, "position": "after", "code": "x = 1"}},
+        {"op": "delete_lines", "params": {"file": "b.py", "start_line": 10, "end_line": 12}},
+    ]
+    warnings = drift_check(plan)
+    assert len(warnings) == 0
+
+
+# --- Layer 3 Tests ---
+
+
+def test_pattern_in_string():
+    """Layer 3: Pattern inside string literal -> warning."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write('msg = "return 42"\ndef foo():\n    return 42\n')
+        f.flush()
+        tmp = f.name
+
+    try:
+        check = ns["_check_pattern_ast_context"]
+        # "return 42" at position inside the string
+        content = open(tmp).read()
+        pos = content.find("return 42")  # First occurrence is in string
+        result = check(tmp, "return 42", pos)
+        assert result is not None
+        assert "string" in result.lower()
+    finally:
+        os.unlink(tmp)
+
+
+def test_pattern_in_comment():
+    """Layer 3: Pattern inside comment -> warning."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("# return 42\ndef foo():\n    return 42\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        check = ns["_check_pattern_ast_context"]
+        content = open(tmp).read()
+        pos = content.find("return 42")  # First occurrence is in comment
+        result = check(tmp, "return 42", pos)
+        assert result is not None
+        assert "comment" in result.lower()
+    finally:
+        os.unlink(tmp)
+
+
+def test_pattern_in_code():
+    """Layer 3: Pattern in normal code -> no warning."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def foo():\n    return 42\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        check = ns["_check_pattern_ast_context"]
+        content = open(tmp).read()
+        pos = content.find("return 42")
+        result = check(tmp, "return 42", pos)
+        assert result is None
+    finally:
+        os.unlink(tmp)
+
+
+# --- Layer 4 Tests ---
+
+
+def test_rename_in_string():
+    """Layer 4: Old name in string literal -> warning with counts."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write('x = my_var + 1\nmsg = "my_var is great"\n# my_var old\n')
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "rename_symbol", "params": {
+            "file": tmp, "old_name": "my_var", "new_name": "new_var"
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert result["passed"] is True
+        # Should have warning about string/comment occurrences
+        assert any("string" in w.lower() or "comment" in w.lower() for w in result["warnings"])
+    finally:
+        os.unlink(tmp)
+
+
+def test_rename_scope_report():
+    """Layer 4: Correctly classify definitions, references, strings."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+    classify = ns["_classify_symbol_occurrences"]
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write('x = 1\nprint(x)\nmsg = "x"\n')
+        f.flush()
+        tmp = f.name
+
+    try:
+        result = classify(tmp, "x")
+        assert result is not None
+        assert result["total"] >= 2
+        assert result["in_strings"] >= 1
+    finally:
+        os.unlink(tmp)
+
+
+# --- Layer 5 Tests ---
+
+
+def test_preflight_syntax_valid():
+    """Layer 5: Replacement produces valid syntax -> no error."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def foo():\n    return 42\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "replace_code", "params": {
+            "file": tmp, "pattern": "return 42", "replacement": "return 99"
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert result["passed"] is True
+        assert not any("syntax" in e.lower() for e in result["errors"])
+    finally:
+        os.unlink(tmp)
+
+
+def test_preflight_syntax_invalid():
+    """Layer 5: Replacement breaks syntax -> error."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def foo():\n    return 42\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "replace_code", "params": {
+            "file": tmp, "pattern": "return 42", "replacement": "return (42"
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert result["passed"] is False
+        assert any("syntax" in e.lower() or "Replacement" in e for e in result["errors"])
+    finally:
+        os.unlink(tmp)
+
+
+# --- Layer 6 Tests ---
+
+
+def test_cross_file_rename_warning():
+    """Layer 6: Renamed symbol imported elsewhere -> warning."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def helper_func():\n    return 42\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "rename_symbol", "params": {
+            "file": tmp, "old_name": "helper_func", "new_name": "new_helper"
+        }}]
+        graph = {
+            "symbols": [{"name": "helper_func", "kind": "function", "file": tmp,
+                         "start_line": 1, "end_line": 2}],
+            "imports": [{"file": "other.py", "module": "helpers", "symbol": "helper_func", "line": 1}],
+            "line_kinds": {},
+        }
+        result = _run_verify(ns, plan, graph)
+        assert result["passed"] is True  # Warning, not error
+        assert any("imported by" in w.lower() or "not in this plan" in w.lower()
+                    for w in result["warnings"])
+    finally:
+        os.unlink(tmp)
+
+
+def test_cross_file_no_impact():
+    """Layer 6: No imports of affected symbol -> no warning."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def private_func():\n    return 42\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "rename_symbol", "params": {
+            "file": tmp, "old_name": "private_func", "new_name": "new_private"
+        }}]
+        graph = {
+            "symbols": [{"name": "private_func", "kind": "function", "file": tmp,
+                         "start_line": 1, "end_line": 2}],
+            "imports": [],  # No imports
+            "line_kinds": {},
+        }
+        result = _run_verify(ns, plan, graph)
+        assert result["passed"] is True
+        assert not any("imported" in w.lower() for w in result["warnings"])
+    finally:
+        os.unlink(tmp)
+
+
+# --- Build import graph tests ---
+
+
+def test_build_import_graph():
+    """Test _build_import_graph builds correct maps."""
+    ns = _get_helper_ns()
+    build = ns["_build_import_graph"]
+
+    graph = {
+        "symbols": [
+            {"name": "Foo", "kind": "class", "file": "foo.py", "start_line": 1, "end_line": 10},
+            {"name": "bar", "kind": "function", "file": "foo.py", "start_line": 12, "end_line": 15},
+        ],
+        "imports": [
+            {"file": "main.py", "module": "foo", "symbol": "Foo", "line": 1},
+            {"file": "test.py", "module": "foo", "symbol": "bar", "line": 1},
+        ],
+        "line_kinds": {},
+    }
+    symbol_importers, file_exports = build(graph)
+    assert "Foo" in symbol_importers
+    assert "main.py" in symbol_importers["Foo"]
+    assert "bar" in symbol_importers
+    assert "test.py" in symbol_importers["bar"]
+    assert "foo.py" in file_exports
+    assert "Foo" in file_exports["foo.py"]
+
+
+# --- verify_plan output format test ---
+
+
+def test_verify_plan_output_has_warnings_field():
+    """Verify that verify_plan output always includes a warnings field."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("x = 1\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "replace_code", "params": {
+            "file": tmp, "pattern": "x = 1", "replacement": "x = 2"
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert "warnings" in result
+        assert isinstance(result["warnings"], list)
+        assert "passed" in result
+        assert "errors" in result
+    finally:
+        os.unlink(tmp)

@@ -186,3 +186,6 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
 
+_bmad/*
+_bmad-output/*
+!_bmad-output/research/

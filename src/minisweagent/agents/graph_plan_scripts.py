@@ -14,6 +14,7 @@ Commands:
     verify_plan '<plan_json>' '<graph_json>'
     execute_step '<step_json>'
 """
+import difflib
 import json
 import os
 import re
@@ -531,11 +532,336 @@ REQUIRED_PARAMS = {
 }
 
 
+# ============================================================
+# Verification helper functions (Layers 1-6)
+# ============================================================
+
+def _fuzzy_find(content, pattern, threshold=0.8):
+    """Find closest match for pattern in content using difflib.
+
+    Line-based sliding window for multi-line patterns,
+    character-level fallback for short single-line patterns (< 200 chars).
+    Returns (similarity_ratio, matched_text) or (0.0, None).
+    """
+    if not pattern or not content:
+        return (0.0, None)
+
+    pattern_lines = pattern.splitlines(True)
+    content_lines = content.splitlines(True)
+    n = len(pattern_lines)
+
+    best_ratio = 0.0
+    best_match = None
+
+    if n > 1 or len(pattern) >= 200:
+        # Line-based sliding window
+        for i in range(max(1, len(content_lines) - n + 1)):
+            window = content_lines[i:i + n]
+            window_text = "".join(window)
+            ratio = difflib.SequenceMatcher(None, pattern, window_text).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = window_text
+    else:
+        # Character-level sliding window for short single-line patterns
+        plen = len(pattern)
+        step = max(1, plen // 4)
+        for i in range(0, max(1, len(content) - plen + 1), step):
+            window = content[i:i + plen + plen // 4]
+            ratio = difflib.SequenceMatcher(None, pattern, window).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = window
+
+    if best_ratio >= threshold:
+        return (best_ratio, best_match)
+    return (0.0, None)
+
+
+def _extract_method_name(method_code):
+    """Extract method name from code string.
+
+    Recognizes: def name(, function name(, name( patterns.
+    Returns name string or None.
+    """
+    if not method_code:
+        return None
+    # Python/Ruby: def name(
+    m = re.search(r'\bdef\s+(\w+)\s*\(', method_code)
+    if m:
+        return m.group(1)
+    # JS/TS: function name( or async function name(
+    m = re.search(r'\bfunction\s+(\w+)\s*\(', method_code)
+    if m:
+        return m.group(1)
+    # Java/Go/general: name(  (first identifier followed by paren)
+    m = re.search(r'\b(\w+)\s*\(', method_code)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _check_line_drift(plan):
+    """Layer 2: Check for cumulative line drift across steps targeting the same file.
+
+    Groups steps by file, walks in order, computes cumulative drift from
+    line-changing operations. Emits warnings for steps that use line numbers
+    when drift != 0.
+    """
+    warnings = []
+    # Group steps by file, preserving order
+    file_steps = {}
+    for i, step in enumerate(plan):
+        fp = step.get("params", {}).get("file", "")
+        if fp and fp != "all":
+            file_steps.setdefault(fp, []).append((i, step))
+
+    for fp, steps in file_steps.items():
+        drift = 0
+        for i, step in steps:
+            op = step.get("op", "")
+            params = step.get("params", {})
+
+            # Warn if this step uses line numbers and drift != 0
+            if op in ("insert_code", "delete_lines", "wrap_block") and drift != 0:
+                warnings.append(
+                    f"Step {i} ({op}): line numbers may be off by {drift:+d} lines "
+                    f"due to earlier edits on {fp}"
+                )
+
+            # Compute drift from this step
+            if op == "insert_code":
+                code = params.get("code", "")
+                drift += code.count("\n") + (1 if not code.endswith("\n") else 0)
+            elif op == "delete_lines":
+                start = params.get("start_line", 0)
+                end = params.get("end_line", 0)
+                if end >= start:
+                    drift -= (end - start + 1)
+            elif op == "wrap_block":
+                # before_code + after_code add at least 2 lines
+                before = params.get("before_code", "")
+                after = params.get("after_code", "")
+                drift += before.count("\n") + (1 if before and not before.endswith("\n") else 0)
+                drift += after.count("\n") + (1 if after and not after.endswith("\n") else 0)
+            elif op == "add_method":
+                code = params.get("method_code", "")
+                drift += code.count("\n") + 2  # newline + code lines
+            elif op == "add_import":
+                drift += 1
+            elif op == "add_class_attribute":
+                drift += 1
+            elif op == "replace_code":
+                old = params.get("pattern", "")
+                new = params.get("replacement", "")
+                old_lines = old.count("\n") + 1
+                new_lines = new.count("\n") + 1
+                drift += new_lines - old_lines
+
+    return warnings
+
+
+def _check_pattern_ast_context(filepath, pattern, match_start):
+    """Layer 3: Check if a text match falls inside a string or comment AST node.
+
+    Returns warning string or None. Graceful degradation if tree-sitter unavailable.
+    """
+    if not _check_treesitter():
+        return None
+
+    lang = detect_language(filepath)
+    if not lang:
+        return None
+
+    try:
+        import tree_sitter_languages
+        parser = tree_sitter_languages.get_parser(lang)
+        source = open(filepath, "rb").read()
+        tree = parser.parse(source)
+    except Exception:
+        return None
+
+    STRING_COMMENT_TYPES = {
+        "string", "comment", "string_literal", "template_string",
+        "line_comment", "block_comment", "string_content",
+        "interpreted_string_literal", "raw_string_literal",
+        "string_fragment", "heredoc_body", "regex",
+    }
+
+    # Convert byte offset to (row, col) for tree-sitter
+    source_bytes = source[:match_start]
+    row = source_bytes.count(b"\n")
+    last_nl = source_bytes.rfind(b"\n")
+    col = match_start - last_nl - 1 if last_nl >= 0 else match_start
+
+    # Find deepest node at position
+    node = tree.root_node.descendant_for_point_range((row, col), (row, col))
+    if node is None:
+        return None
+
+    # Walk ancestors checking for string/comment types
+    current = node
+    while current is not None:
+        if current.type in STRING_COMMENT_TYPES:
+            return (
+                f"Pattern match in {filepath} at offset {match_start} "
+                f"is inside a {current.type} node (may not be actual code)"
+            )
+        current = current.parent
+
+    return None
+
+
+def _classify_symbol_occurrences(filepath, symbol_name):
+    """Layer 4: Classify all occurrences of a symbol in a file.
+
+    Returns {definitions, references, in_strings, in_comments, total} or None.
+    """
+    if not _check_treesitter():
+        return None
+
+    lang = detect_language(filepath)
+    if not lang:
+        return None
+
+    try:
+        import tree_sitter_languages
+        parser = tree_sitter_languages.get_parser(lang)
+        source = open(filepath, "rb").read()
+        tree = parser.parse(source)
+    except Exception:
+        return None
+
+    STRING_TYPES = {
+        "string", "string_literal", "template_string",
+        "interpreted_string_literal", "raw_string_literal",
+        "string_content", "string_fragment", "heredoc_body",
+    }
+    COMMENT_TYPES = {"comment", "line_comment", "block_comment"}
+    DEFINITION_NODE_TYPES = {
+        "function_definition", "function_declaration", "method_definition",
+        "method_declaration", "class_definition", "class_declaration",
+        "variable_declarator", "assignment", "function_item",
+        "struct_item", "enum_item", "trait_item",
+    }
+
+    counts = {"definitions": 0, "references": 0, "in_strings": 0, "in_comments": 0, "total": 0}
+
+    def _walk(node):
+        if node.type == "identifier" or node.type == "type_identifier":
+            text = node.text.decode("utf-8") if isinstance(node.text, bytes) else node.text
+            if text == symbol_name:
+                counts["total"] += 1
+                # Check ancestors for context
+                parent = node.parent
+                in_string = False
+                in_comment = False
+                is_def = False
+                ancestor = node.parent
+                while ancestor is not None:
+                    if ancestor.type in STRING_TYPES:
+                        in_string = True
+                        break
+                    if ancestor.type in COMMENT_TYPES:
+                        in_comment = True
+                        break
+                    ancestor = ancestor.parent
+                if in_string:
+                    counts["in_strings"] += 1
+                elif in_comment:
+                    counts["in_comments"] += 1
+                elif parent and parent.type in DEFINITION_NODE_TYPES:
+                    # Check if this identifier is the name field
+                    if parent.child_by_field_name("name") == node:
+                        counts["definitions"] += 1
+                    else:
+                        counts["references"] += 1
+                else:
+                    counts["references"] += 1
+        for child in node.children:
+            _walk(child)
+
+    _walk(tree.root_node)
+    return counts if counts["total"] > 0 else None
+
+
+def _syntax_check_content(content_str, filepath):
+    """Layer 5: Check syntax of content string (not file on disk).
+
+    Like _syntax_check() but takes content string instead of reading file.
+    Returns (ok, error_message).
+    """
+    lang = detect_language(filepath)
+    if lang is None or not _check_treesitter():
+        return (True, None)
+
+    try:
+        import tree_sitter_languages
+        parser = tree_sitter_languages.get_parser(lang)
+        source = content_str.encode("utf-8") if isinstance(content_str, str) else content_str
+        tree = parser.parse(source)
+        if _has_error_nodes(tree.root_node):
+            return (False, f"Replacement produces syntax error in {filepath}")
+        return (True, None)
+    except Exception:
+        return (True, None)
+
+
+def _build_import_graph(graph):
+    """Layer 6: Build import relationship maps from graph data.
+
+    Returns (symbol_importers, file_exports):
+      symbol_importers: symbol_name -> set of files that import it
+      file_exports: file_path -> set of symbol names it defines
+    """
+    symbol_importers = {}  # symbol_name -> set(files)
+    file_exports = {}      # file_path -> set(symbol_names)
+
+    # Build file_exports from symbols
+    for sym in graph.get("symbols", []):
+        fp = sym.get("file", "")
+        name = sym.get("name", "")
+        if fp and name:
+            file_exports.setdefault(fp, set()).add(name)
+
+    # Build symbol_importers from imports
+    for imp in graph.get("imports", []):
+        importing_file = imp.get("file", "")
+        symbol = imp.get("symbol")
+        module = imp.get("module", "")
+
+        if symbol and symbol != "*":
+            # Direct symbol import: from X import symbol
+            symbol_importers.setdefault(symbol, set()).add(importing_file)
+        elif module:
+            # Module-level import: try matching module name to file stems
+            module_stem = module.rsplit(".", 1)[-1] if "." in module else module
+            module_stem = module_stem.rsplit("/", 1)[-1] if "/" in module_stem else module_stem
+            # Check if any exported symbol name matches the module stem
+            for fp, exports in file_exports.items():
+                file_stem = os.path.splitext(os.path.basename(fp))[0]
+                if file_stem == module_stem:
+                    for exp_name in exports:
+                        symbol_importers.setdefault(exp_name, set()).add(importing_file)
+
+    return symbol_importers, file_exports
+
+
 def verify_plan(plan_json, graph_json):
-    """Verify plan preconditions against graph."""
+    """Verify plan preconditions against graph.
+
+    Layer 0: Structural checks (valid operator, required params, file exists, symbol in graph, line range)
+    Layer 1: Content existence checks (pattern found, signature found, duplicate detection)
+    Layer 2: Line drift detection (cumulative line number shifts from earlier edits)
+    Layer 3: AST context checks (pattern inside string/comment)
+    Layer 4: Symbol occurrence classification (rename affects strings/comments)
+    Layer 5: Preflight syntax check (simulated replacement produces valid syntax)
+    Layer 6: Cross-file impact analysis (renamed/deleted symbols imported elsewhere)
+    """
     plan = json.loads(plan_json)
     graph = json.loads(graph_json)
     errors = []
+    warnings = []
 
     symbols = graph.get("symbols", [])
     line_kinds = graph.get("line_kinds", {})
@@ -543,6 +869,8 @@ def verify_plan(plan_json, graph_json):
     for i, step in enumerate(plan):
         op = step.get("op", "")
         params = step.get("params", {})
+
+        # === Layer 0: Structural checks ===
 
         # Check valid operator
         if op not in VALID_OPS:
@@ -561,7 +889,7 @@ def verify_plan(plan_json, graph_json):
             errors.append(f"Step {i}: File '{file_path}' does not exist")
             continue
 
-        # Operator-specific checks
+        # Operator-specific structural checks
         if op in ("add_method", "add_class_attribute"):
             class_name = params.get("class_name", "")
             found = any(
@@ -593,7 +921,156 @@ def verify_plan(plan_json, graph_json):
             if start > end:
                 errors.append(f"Step {i} ({op}): start_line ({start}) > end_line ({end})")
 
-    print(json.dumps({"passed": len(errors) == 0, "errors": errors}))
+        # === Layer 1: Content existence checks ===
+
+        if file_path and file_path != "all" and os.path.isfile(file_path):
+            try:
+                content = open(file_path).read()
+            except Exception:
+                content = None
+
+            if content is not None:
+                if op == "replace_code":
+                    pattern = params.get("pattern", "")
+                    if pattern and pattern not in content:
+                        ratio, matched = _fuzzy_find(content, pattern)
+                        if ratio > 0:
+                            preview = (matched[:60] + "...") if matched and len(matched) > 60 else matched
+                            warnings.append(
+                                f"Step {i} (replace_code): Pattern not found exactly, "
+                                f"but {ratio:.0%} similar match found: {preview!r}"
+                            )
+                        else:
+                            errors.append(
+                                f"Step {i} (replace_code): Pattern not found in {file_path}: "
+                                f"{pattern[:80]!r}"
+                            )
+
+                elif op == "modify_function_signature":
+                    old_sig = params.get("old_signature", "")
+                    if old_sig and old_sig not in content:
+                        errors.append(
+                            f"Step {i} (modify_function_signature): Old signature not found in "
+                            f"{file_path}: {old_sig[:80]!r}"
+                        )
+
+                elif op == "rename_symbol":
+                    old_name = params.get("old_name", "")
+                    if old_name and not re.search(r'\b' + re.escape(old_name) + r'\b', content):
+                        errors.append(
+                            f"Step {i} (rename_symbol): Symbol '{old_name}' not found in {file_path}"
+                        )
+
+                elif op == "add_import":
+                    import_stmt = params.get("import_statement", "").strip()
+                    if import_stmt and import_stmt in content:
+                        warnings.append(
+                            f"Step {i} (add_import): Import already exists in {file_path}: "
+                            f"{import_stmt[:80]!r}"
+                        )
+
+                elif op == "add_method":
+                    method_code = params.get("method_code", "")
+                    method_name = _extract_method_name(method_code)
+                    if method_name and re.search(r'\bdef\s+' + re.escape(method_name) + r'\s*\(', content):
+                        warnings.append(
+                            f"Step {i} (add_method): Method '{method_name}' may already exist in {file_path}"
+                        )
+
+                # === Layer 3: AST context checks ===
+
+                if op == "replace_code":
+                    pattern = params.get("pattern", "")
+                    if pattern and pattern in content:
+                        match_pos = content.find(pattern)
+                        ast_warn = _check_pattern_ast_context(file_path, pattern, match_pos)
+                        if ast_warn:
+                            warnings.append(f"Step {i} (replace_code): {ast_warn}")
+
+                # === Layer 4: Symbol occurrence classification ===
+
+                if op == "rename_symbol":
+                    old_name = params.get("old_name", "")
+                    if old_name:
+                        occurrences = _classify_symbol_occurrences(file_path, old_name)
+                        if occurrences:
+                            if occurrences["in_strings"] > 0 or occurrences["in_comments"] > 0:
+                                warnings.append(
+                                    f"Step {i} (rename_symbol): '{old_name}' also appears in "
+                                    f"strings ({occurrences['in_strings']}x) and "
+                                    f"comments ({occurrences['in_comments']}x) -- "
+                                    f"regex rename will change these too"
+                                )
+
+                # === Layer 5: Preflight syntax check ===
+
+                if op == "replace_code":
+                    pattern = params.get("pattern", "")
+                    replacement = params.get("replacement", "")
+                    if pattern and pattern in content:
+                        simulated = content.replace(pattern, replacement, 1)
+                        ok, err = _syntax_check_content(simulated, file_path)
+                        if not ok:
+                            errors.append(f"Step {i} (replace_code): {err}")
+
+    # === Layer 2: Line drift detection (post-loop) ===
+    drift_warnings = _check_line_drift(plan)
+    warnings.extend(drift_warnings)
+
+    # === Layer 6: Cross-file impact analysis (post-loop) ===
+    try:
+        symbol_importers, file_exports = _build_import_graph(graph)
+        plan_files = set()
+        for step in plan:
+            fp = step.get("params", {}).get("file", "")
+            if fp:
+                plan_files.add(fp)
+
+        for i, step in enumerate(plan):
+            op = step.get("op", "")
+            params = step.get("params", {})
+
+            if op == "rename_symbol":
+                old_name = params.get("old_name", "")
+                if old_name in symbol_importers:
+                    affected = symbol_importers[old_name] - plan_files
+                    if affected:
+                        warnings.append(
+                            f"Step {i} (rename_symbol): '{old_name}' is imported by files "
+                            f"not in this plan: {sorted(affected)}"
+                        )
+
+            elif op == "modify_function_signature":
+                func_name = params.get("func_name", "")
+                if func_name in symbol_importers:
+                    affected = symbol_importers[func_name] - plan_files
+                    if affected:
+                        warnings.append(
+                            f"Step {i} (modify_function_signature): '{func_name}' is imported by "
+                            f"files not in this plan: {sorted(affected)}"
+                        )
+
+            elif op == "delete_lines":
+                fp = params.get("file", "")
+                start = params.get("start_line", 0)
+                end = params.get("end_line", 0)
+                if fp and start and end:
+                    for sym in symbols:
+                        if (sym["file"] == fp
+                                and sym["start_line"] >= start
+                                and sym["end_line"] <= end):
+                            sym_name = sym["name"]
+                            if sym_name in symbol_importers:
+                                affected = symbol_importers[sym_name] - plan_files
+                                if affected:
+                                    warnings.append(
+                                        f"Step {i} (delete_lines): Deleting '{sym_name}' "
+                                        f"which is imported by: {sorted(affected)}"
+                                    )
+    except Exception:
+        pass  # Graceful degradation
+
+    print(json.dumps({"passed": len(errors) == 0, "errors": errors, "warnings": warnings}))
 
 
 # ============================================================
