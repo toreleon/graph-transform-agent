@@ -192,7 +192,8 @@ def test_explore_to_plan_early_submit(graphplan_config):
 def test_helper_script_deployment(graphplan_config):
     """Test that helper script is deployed to the environment."""
     mock_env = MagicMock()
-    mock_env.execute.return_value = {"output": "", "returncode": 0, "exception_info": ""}
+    # Functional check passes (returns "ok"), then script deployment succeeds
+    mock_env.execute.return_value = {"output": "ok list", "returncode": 0, "exception_info": ""}
     mock_env.get_template_vars.return_value = {}
     mock_env.serialize.return_value = {}
 
@@ -205,8 +206,8 @@ def test_helper_script_deployment(graphplan_config):
     agent._deploy_helper_scripts()
     assert agent._scripts_deployed is True
     # Verify env.execute was called with the helper script content
-    call_args = mock_env.execute.call_args[0][0]
-    assert "graphplan_helper.py" in call_args["command"]
+    all_commands = [c[0][0]["command"] for c in mock_env.execute.call_args_list]
+    assert any("graphplan_helper.py" in c for c in all_commands)
 
 
 def test_step_limit_during_explore(graphplan_config):
@@ -292,6 +293,16 @@ def test_extract_plan_json_from_text():
 
     # No JSON at all
     text = "I don't know what to do"
+    result = GraphPlanAgent._extract_plan_json_from_text(text)
+    assert result == "[]"
+
+    # File list should NOT be treated as a plan (no "op" key)
+    text = 'READY_TO_PLAN: ["src/foo.py", "src/bar.py"]'
+    result = GraphPlanAgent._extract_plan_json_from_text(text)
+    assert result == "[]"
+
+    # Array of non-dict items should NOT be treated as a plan
+    text = '```json\n["file1.py", "file2.py"]\n```'
     result = GraphPlanAgent._extract_plan_json_from_text(text)
     assert result == "[]"
 
@@ -567,11 +578,12 @@ public class Calculator {
 
 
 def test_install_treesitter_already_available(graphplan_config):
-    """Verify _install_treesitter skips install when already present."""
+    """Verify _install_treesitter skips install when functional check passes."""
     mock_env = MagicMock()
     mock_env.get_template_vars.return_value = {}
     mock_env.serialize.return_value = {}
-    mock_env.execute.return_value = {"output": "", "returncode": 0, "exception_info": ""}
+    # Functional check passes
+    mock_env.execute.return_value = {"output": "ok list", "returncode": 0, "exception_info": ""}
 
     agent = GraphPlanAgent(
         model=DeterministicToolcallModel(outputs=[]),
@@ -581,9 +593,9 @@ def test_install_treesitter_already_available(graphplan_config):
 
     agent._install_treesitter()
     assert agent._treesitter_installed is True
-    # Only the check command should have been called, not pip install
+    # Only the functional check should have been called, not pip install
     calls = [c[0][0]["command"] for c in mock_env.execute.call_args_list]
-    assert any("from tree_sitter_languages" in c for c in calls)
+    assert any("get_parser" in c for c in calls)
     assert not any("pip install" in c for c in calls)
 
 
@@ -593,10 +605,12 @@ def test_install_treesitter_not_available(graphplan_config):
     mock_env.get_template_vars.return_value = {}
     mock_env.serialize.return_value = {}
 
-    # First call (check): fails. Second call (install): succeeds.
+    # First call (functional check): fails. Second call (install): succeeds.
+    # Third call (verification): succeeds.
     mock_env.execute.side_effect = [
         {"output": "ImportError", "returncode": 1, "exception_info": ""},
         {"output": "Successfully installed", "returncode": 0, "exception_info": ""},
+        {"output": "ok list 1", "returncode": 0, "exception_info": ""},
     ]
 
     agent = GraphPlanAgent(

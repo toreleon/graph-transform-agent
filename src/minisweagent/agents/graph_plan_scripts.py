@@ -419,29 +419,41 @@ def build_graph_ts(file_paths):
     """Parse files with tree-sitter, build graph."""
     import tree_sitter_languages
 
-    result = {"symbols": [], "imports": [], "line_kinds": {}}
+    result = {"symbols": [], "imports": [], "line_kinds": {}, "errors": []}
 
     for fp in file_paths:
         lang = detect_language(fp)
         if lang is None:
+            result["errors"].append(f"Unsupported file type: {fp}")
             continue
 
         try:
             source = open(fp, "rb").read()
-        except (FileNotFoundError, PermissionError):
+        except (FileNotFoundError, PermissionError) as e:
+            result["errors"].append(f"Cannot read {fp}: {e}")
             continue
 
         try:
             parser = tree_sitter_languages.get_parser(lang)
-        except Exception:
+        except Exception as e:
+            result["errors"].append(f"Cannot get parser for {lang} ({fp}): {e}")
             continue
 
-        tree = parser.parse(source)
+        try:
+            tree = parser.parse(source)
+        except Exception as e:
+            result["errors"].append(f"Parse failed for {fp}: {e}")
+            continue
+
         root = tree.root_node
 
         queries = LANGUAGE_QUERIES.get(lang)
         if queries:
-            ts_lang = tree_sitter_languages.get_language(lang)
+            try:
+                ts_lang = tree_sitter_languages.get_language(lang)
+            except Exception as e:
+                result["errors"].append(f"Cannot get language {lang}: {e}")
+                continue
 
             # Extract symbols
             if queries.get("symbols"):
@@ -449,8 +461,8 @@ def build_graph_ts(file_paths):
                     query = ts_lang.query(queries["symbols"])
                     captures = query.captures(root)
                     _extract_symbols_from_captures(captures, fp, lang, result)
-                except Exception:
-                    pass
+                except Exception as e:
+                    result["errors"].append(f"Symbol query failed for {fp} ({lang}): {e}")
 
             # Extract imports
             if queries.get("imports"):
@@ -458,14 +470,17 @@ def build_graph_ts(file_paths):
                     query = ts_lang.query(queries["imports"])
                     captures = query.captures(root)
                     _extract_imports_from_captures(captures, fp, lang, result)
-                except Exception:
-                    pass
+                except Exception as e:
+                    result["errors"].append(f"Import query failed for {fp} ({lang}): {e}")
 
         # Line kinds
         kind_map = LINE_KIND_MAP.get(lang, {})
         if kind_map:
             file_line_kinds = {}
-            _walk_for_line_kinds(root, kind_map, file_line_kinds)
+            try:
+                _walk_for_line_kinds(root, kind_map, file_line_kinds)
+            except Exception as e:
+                result["errors"].append(f"Line kinds walk failed for {fp}: {e}")
             if file_line_kinds:
                 result["line_kinds"][fp] = file_line_kinds
 
@@ -476,12 +491,20 @@ def build_graph(file_paths):
     """Parse files and extract symbols + imports + line info.
 
     Uses tree-sitter for all supported languages. If tree-sitter is not
-    available, returns an empty graph.
+    available, returns an empty graph with an error message.
     """
     if _check_treesitter():
         build_graph_ts(file_paths)
     else:
-        print(json.dumps({"symbols": [], "imports": [], "line_kinds": {}}))
+        # Try importing to get the actual error message
+        err_msg = "tree-sitter-languages not available"
+        try:
+            import tree_sitter_languages  # noqa: F401
+        except ImportError as e:
+            err_msg = f"tree-sitter-languages import failed: {e}"
+        except Exception as e:
+            err_msg = f"tree-sitter-languages error: {e}"
+        print(json.dumps({"symbols": [], "imports": [], "line_kinds": {}, "errors": [err_msg]}))
 
 
 # ============================================================

@@ -175,28 +175,62 @@ class GraphPlanAgent(DefaultAgent):
     def _install_treesitter(self):
         """Install tree-sitter-languages in the container if not already present.
 
-        Non-fatal: logs a warning on failure and continues (Python-only mode).
+        Non-fatal: logs a warning on failure and continues (empty-graph mode).
+        Only installs tree-sitter-languages (not tree-sitter separately) to avoid
+        version conflicts — tree-sitter-languages bundles compatible tree-sitter.
         """
         if self._treesitter_installed:
             return
-        check = self.env.execute(
-            {"command": "python3 -c 'from tree_sitter_languages import get_parser' 2>/dev/null"}
+        # Functional check: can we actually parse a Python snippet?
+        func_check = self.env.execute(
+            {"command": (
+                "python3 -c '"
+                "from tree_sitter_languages import get_parser, get_language; "
+                "p = get_parser(\"python\"); "
+                "t = p.parse(b\"def f(): pass\"); "
+                "q = get_language(\"python\").query(\"(function_definition) @f\"); "
+                "c = q.captures(t.root_node); "
+                "print(\"ok\", type(c).__name__)"
+                "' 2>&1"
+            )}
         )
-        if check.get("returncode", -1) == 0:
+        if func_check.get("returncode", -1) == 0 and "ok" in func_check.get("output", ""):
             self._treesitter_installed = True
-            logger.info("tree-sitter-languages already available in container")
+            logger.info(f"tree-sitter-languages functional check passed: {func_check.get('output', '').strip()}")
             return
         logger.info("Installing tree-sitter-languages in container...")
+        # Pin tree-sitter<0.21 for compatibility with tree-sitter-languages.
+        # tree-sitter 0.21+ changed Language.__init__() from (path, name) to (ptr),
+        # which breaks tree-sitter-languages' Cython bindings.
         install = self.env.execute(
-            {"command": "pip install tree-sitter tree-sitter-languages --quiet --disable-pip-version-check 2>&1"}
+            {"command": "pip install 'tree-sitter<0.21' tree-sitter-languages --quiet --disable-pip-version-check 2>&1"}
         )
-        if install.get("returncode", -1) == 0:
+        if install.get("returncode", -1) != 0:
+            logger.warning(
+                f"Failed to install tree-sitter-languages (non-fatal): "
+                f"{install.get('output', '')[:200]}"
+            )
+            return
+        # Verify installation with functional check
+        verify = self.env.execute(
+            {"command": (
+                "python3 -c '"
+                "from tree_sitter_languages import get_parser, get_language; "
+                "p = get_parser(\"python\"); "
+                "t = p.parse(b\"def f(): pass\"); "
+                "q = get_language(\"python\").query(\"(function_definition) @f\"); "
+                "c = q.captures(t.root_node); "
+                "print(\"ok\", type(c).__name__, len(c) if isinstance(c, list) else sum(len(v) for v in c.values()))"
+                "' 2>&1"
+            )}
+        )
+        if verify.get("returncode", -1) == 0 and "ok" in verify.get("output", ""):
             self._treesitter_installed = True
-            logger.info("tree-sitter-languages installed successfully")
+            logger.info(f"tree-sitter-languages installed and verified: {verify.get('output', '').strip()}")
         else:
             logger.warning(
-                f"Failed to install tree-sitter-languages (non-fatal, Python-only mode): "
-                f"{install.get('output', '')[:200]}"
+                f"tree-sitter-languages installed but functional check failed: "
+                f"{verify.get('output', '')[:300]}"
             )
 
     def _deploy_helper_scripts(self):
@@ -301,6 +335,15 @@ class GraphPlanAgent(DefaultAgent):
             logger.warning(f"Graph JSON parse failed: {e}, output: {graph_json[:200]}")
             return "{}", ""
 
+        # Log any errors from the graph build
+        graph_errors = graph_data.get("errors", [])
+        if graph_errors:
+            for err in graph_errors:
+                logger.warning(f"Graph build error: {err}")
+            _console.print(f"[yellow]Graph build had {len(graph_errors)} error(s):[/yellow]")
+            for err in graph_errors[:5]:
+                _console.print(f"  [yellow]- {err}[/yellow]")
+
         # Build a compact text view for the LLM
         view_lines = []
         for fp in sorted(set(s["file"] for s in graph_data.get("symbols", []))):
@@ -386,6 +429,14 @@ class GraphPlanAgent(DefaultAgent):
         logger.warning("Failed to generate plan after max attempts")
         return "[]"
 
+    @staticmethod
+    def _is_valid_plan(plan: list) -> bool:
+        """Check that a parsed JSON array looks like a plan (list of op dicts)."""
+        if not isinstance(plan, list) or len(plan) == 0:
+            return False
+        # At least the first element must be a dict with an "op" key
+        return isinstance(plan[0], dict) and "op" in plan[0]
+
     def _read_plan_file(self) -> str:
         """Read and validate the plan file from the container."""
         result = self.env.execute({"command": "cat /tmp/edit_plan.json 2>/dev/null"})
@@ -396,7 +447,7 @@ class GraphPlanAgent(DefaultAgent):
             return ""
         try:
             plan = json.loads(content)
-            if isinstance(plan, list) and len(plan) > 0:
+            if self._is_valid_plan(plan):
                 return content
         except json.JSONDecodeError:
             pass
@@ -420,11 +471,21 @@ class GraphPlanAgent(DefaultAgent):
 
     @staticmethod
     def _extract_plan_json_from_text(text: str) -> str:
-        """Extract JSON plan array from raw text."""
+        """Extract JSON plan array from raw text.
+
+        Validates that the array contains plan step dicts (with "op" key)
+        to avoid accidentally picking up file lists or other JSON arrays.
+        """
         # Try ```json [...] ``` first
         match = PLAN_JSON_PATTERN.search(text)
         if match:
-            return match.group(1).strip()
+            candidate = match.group(1).strip()
+            try:
+                parsed = json.loads(candidate)
+                if GraphPlanAgent._is_valid_plan(parsed):
+                    return candidate
+            except json.JSONDecodeError:
+                pass
 
         # Fallback: find raw JSON array
         start = text.find("[")
@@ -433,7 +494,7 @@ class GraphPlanAgent(DefaultAgent):
             candidate = text[start:end + 1]
             try:
                 parsed = json.loads(candidate)
-                if isinstance(parsed, list) and len(parsed) > 0:
+                if GraphPlanAgent._is_valid_plan(parsed):
                     return candidate
             except json.JSONDecodeError:
                 pass
