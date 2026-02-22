@@ -93,7 +93,7 @@ def main(
         config.get("agent", {}),
         default_type="interactive",
     )
-    agent.run(instance["problem_statement"])
+    agent.run(instance["problem_statement"], instance=instance)
 
 
 if __name__ == "__main__":

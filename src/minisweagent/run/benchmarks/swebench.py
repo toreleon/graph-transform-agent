@@ -17,6 +17,7 @@ from jinja2 import StrictUndefined, Template
 from rich.live import Live
 
 from minisweagent import Environment
+from minisweagent.agents import get_agent_class
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
@@ -65,18 +66,27 @@ app = typer.Typer(rich_markup_mode="rich", add_completion=False)
 _OUTPUT_FILE_LOCK = threading.Lock()
 
 
-class ProgressTrackingAgent(DefaultAgent):
-    """Simple wrapper around DefaultAgent that provides progress updates."""
+def _make_progress_tracking_class(base_class: type) -> type:
+    """Create a progress-tracking subclass of any agent class."""
 
-    def __init__(self, *args, progress_manager: RunBatchProgressManager, instance_id: str = "", **kwargs):
-        super().__init__(*args, **kwargs)
-        self.progress_manager: RunBatchProgressManager = progress_manager
-        self.instance_id = instance_id
+    class ProgressTrackingAgent(base_class):
+        """Wrapper that provides progress updates for batch runs."""
 
-    def step(self) -> dict:
-        """Override step to provide progress updates."""
-        self.progress_manager.update_instance_status(self.instance_id, f"Step {self.n_calls + 1:3d} (${self.cost:.2f})")
-        return super().step()
+        def __init__(self, *args, progress_manager: RunBatchProgressManager, instance_id: str = "", **kwargs):
+            super().__init__(*args, **kwargs)
+            self.progress_manager: RunBatchProgressManager = progress_manager
+            self.instance_id = instance_id
+
+        def step(self) -> dict:
+            """Override step to provide progress updates."""
+            self.progress_manager.update_instance_status(
+                self.instance_id, f"Step {self.n_calls + 1:3d} (${self.cost:.2f})"
+            )
+            return super().step()
+
+    ProgressTrackingAgent.__name__ = f"ProgressTracking{base_class.__name__}"
+    ProgressTrackingAgent.__qualname__ = f"ProgressTracking{base_class.__name__}"
+    return ProgressTrackingAgent
 
 
 def get_swebench_docker_image_name(instance: dict) -> str:
@@ -158,14 +168,18 @@ def process_instance(
 
     try:
         env = get_sb_environment(config, instance)
-        agent = ProgressTrackingAgent(
+        agent_config = dict(config.get("agent", {}))
+        agent_class_spec = agent_config.pop("agent_class", "default")
+        base_class = get_agent_class(agent_class_spec)
+        TrackedClass = _make_progress_tracking_class(base_class)
+        agent = TrackedClass(
             model,
             env,
             progress_manager=progress_manager,
             instance_id=instance_id,
-            **config.get("agent", {}),
+            **agent_config,
         )
-        info = agent.run(task)
+        info = agent.run(task, instance=instance)
         exit_status = info.get("exit_status")
         result = info.get("submission")
     except Exception as e:
