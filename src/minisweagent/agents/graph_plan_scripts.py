@@ -1,22 +1,19 @@
 """Helper script that runs INSIDE the SWE-bench Docker container.
 
 Contains the HELPER_SCRIPT constant as a Python string. The script
-uses only Python stdlib (ast, json, sys, os) by default. When
-tree-sitter-languages is available, it also supports parsing JS, TS,
-Java, Go, Rust, Ruby, PHP, C, and C++ files.
+uses tree-sitter-languages for parsing all supported languages
+(Python, JS, TS, Java, Go, Rust, Ruby, PHP, C, C++).
 """
 
 HELPER_SCRIPT = r'''#!/usr/bin/env python3
 """GraphPlan helper - runs inside the SWE-bench Docker container.
-Uses Python stdlib (ast, json, sys, os) for Python files.
-Optionally uses tree-sitter-languages for multi-language support.
+Uses tree-sitter-languages for multi-language code parsing.
 
 Commands:
     build_graph file1.py file2.py ...
     verify_plan '<plan_json>' '<graph_json>'
     execute_step '<step_json>'
 """
-import ast
 import json
 import os
 import re
@@ -74,6 +71,16 @@ def _check_treesitter():
 # ============================================================
 
 LANGUAGE_QUERIES = {
+    "python": {
+        "symbols": """
+            (class_definition name: (identifier) @def) @class_node
+            (function_definition name: (identifier) @def) @func_node
+        """,
+        "imports": """
+            (import_statement) @import
+            (import_from_statement) @import
+        """,
+    },
     "javascript": {
         "symbols": """
             (class_declaration name: (identifier) @def) @class_node
@@ -185,6 +192,11 @@ LANGUAGE_QUERIES = {
 
 # Line-kind node types per language (tree-sitter node type -> normalized kind)
 LINE_KIND_MAP = {
+    "python": {
+        "if_statement": "if_statement", "for_statement": "for_statement",
+        "while_statement": "while_statement", "return_statement": "return_statement",
+        "raise_statement": "raise_statement", "try_statement": "try_statement",
+    },
     "javascript": {
         "if_statement": "if_statement", "for_statement": "for_statement",
         "for_in_statement": "for_statement", "while_statement": "while_statement",
@@ -238,69 +250,6 @@ LINE_KIND_MAP = {
 # ============================================================
 # build_graph: Parse files, extract symbols + imports
 # ============================================================
-
-def _build_graph_python_ast(fp, result):
-    """Parse a single Python file with ast, populate result dict."""
-    try:
-        source = open(fp).read()
-        tree = ast.parse(source)
-    except (SyntaxError, FileNotFoundError, PermissionError):
-        return
-
-    file_line_kinds = {}
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            result["symbols"].append({
-                "name": node.name,
-                "kind": "class",
-                "file": fp,
-                "start_line": node.lineno,
-                "end_line": getattr(node, "end_lineno", None) or node.lineno,
-            })
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            result["symbols"].append({
-                "name": node.name,
-                "kind": "function",
-                "file": fp,
-                "start_line": node.lineno,
-                "end_line": getattr(node, "end_lineno", None) or node.lineno,
-            })
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                result["imports"].append({
-                    "file": fp,
-                    "module": alias.name,
-                    "symbol": None,
-                    "line": node.lineno,
-                })
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            for alias in node.names:
-                result["imports"].append({
-                    "file": fp,
-                    "module": module,
-                    "symbol": alias.name,
-                    "line": node.lineno,
-                })
-
-        # Track line-level node kinds for key constructs
-        if isinstance(node, ast.If):
-            file_line_kinds[str(node.lineno)] = "if_statement"
-        elif isinstance(node, ast.For):
-            file_line_kinds[str(node.lineno)] = "for_statement"
-        elif isinstance(node, ast.While):
-            file_line_kinds[str(node.lineno)] = "while_statement"
-        elif isinstance(node, ast.Return):
-            file_line_kinds[str(node.lineno)] = "return_statement"
-        elif isinstance(node, ast.Raise):
-            file_line_kinds[str(node.lineno)] = "raise_statement"
-        elif isinstance(node, ast.Try):
-            file_line_kinds[str(node.lineno)] = "try_statement"
-
-    if file_line_kinds:
-        result["line_kinds"][fp] = file_line_kinds
-
 
 def _node_type_to_kind(node_type, lang):
     """Map a tree-sitter capture tag to a normalized symbol kind."""
@@ -383,7 +332,18 @@ def _extract_symbols_from_captures(captures, fp, lang, result):
 def _parse_import_text(text, lang):
     """Parse import node text into (module, symbol) tuple."""
     text = text.strip()
-    if lang in ("javascript", "typescript"):
+    if lang == "python":
+        # from os.path import join  or  import os
+        if text.startswith("from "):
+            m = re.match(r'from\s+(\S+)\s+import\s+(.+)', text)
+            if m:
+                return (m.group(1), m.group(2).strip())
+        elif text.startswith("import "):
+            m = re.match(r'import\s+(\S+)', text)
+            if m:
+                return (m.group(1), None)
+        return (text, None)
+    elif lang in ("javascript", "typescript"):
         # import X from 'module' or require('module')
         m = re.search(r"""(?:from\s+['"](.+?)['"]|require\s*\(\s*['"](.+?)['"]\s*\))""", text)
         module = m.group(1) or m.group(2) if m else text
@@ -456,7 +416,7 @@ def _walk_for_line_kinds(node, kind_map, file_line_kinds):
 
 
 def build_graph_ts(file_paths):
-    """Parse files with tree-sitter (non-Python) and ast (Python), build graph."""
+    """Parse files with tree-sitter, build graph."""
     import tree_sitter_languages
 
     result = {"symbols": [], "imports": [], "line_kinds": {}}
@@ -464,10 +424,6 @@ def build_graph_ts(file_paths):
     for fp in file_paths:
         lang = detect_language(fp)
         if lang is None:
-            continue
-
-        if lang == "python":
-            _build_graph_python_ast(fp, result)
             continue
 
         try:
@@ -519,24 +475,13 @@ def build_graph_ts(file_paths):
 def build_graph(file_paths):
     """Parse files and extract symbols + imports + line info.
 
-    Dispatches to tree-sitter for non-Python files if available,
-    otherwise uses ast for .py files and skips others.
+    Uses tree-sitter for all supported languages. If tree-sitter is not
+    available, returns an empty graph.
     """
-    has_non_python = any(detect_language(fp) not in (None, "python") for fp in file_paths)
-
-    if has_non_python and _check_treesitter():
+    if _check_treesitter():
         build_graph_ts(file_paths)
-        return
-
-    # Python-only (or tree-sitter not available): use ast
-    result = {"symbols": [], "imports": [], "line_kinds": {}}
-    for fp in file_paths:
-        lang = detect_language(fp)
-        if lang == "python":
-            _build_graph_python_ast(fp, result)
-        # Skip non-Python files when tree-sitter is not available
-
-    print(json.dumps(result))
+    else:
+        print(json.dumps({"symbols": [], "imports": [], "line_kinds": {}}))
 
 
 # ============================================================
@@ -651,9 +596,9 @@ def _find_class_node_ts(filepath, class_name):
         return None
 
     def _search(node):
-        # Look for class/struct/interface declarations
-        if node.type in ("class_declaration", "class_specifier", "struct_specifier",
-                         "interface_declaration", "trait_item"):
+        # Look for class/struct/interface definitions/declarations
+        if node.type in ("class_definition", "class_declaration", "class_specifier",
+                         "struct_specifier", "interface_declaration", "trait_item"):
             name_node = node.child_by_field_name("name")
             if name_node:
                 name = name_node.text.decode("utf-8") if isinstance(name_node.text, bytes) else name_node.text
@@ -667,6 +612,45 @@ def _find_class_node_ts(filepath, class_name):
         for child in node.children:
             result = _search(child)
             if result:
+                return result
+        return None
+
+    return _search(tree.root_node)
+
+
+def _find_python_docstring_end_ts(filepath, class_name):
+    """Find the end line of a class docstring in Python using tree-sitter.
+
+    Returns 1-indexed line number (insert AFTER this line), or None if no docstring.
+    """
+    if not _check_treesitter():
+        return None
+
+    import tree_sitter_languages
+    try:
+        parser = tree_sitter_languages.get_parser("python")
+        source = open(filepath, "rb").read()
+        tree = parser.parse(source)
+    except Exception:
+        return None
+
+    def _search(node):
+        if node.type == "class_definition":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                name = name_node.text.decode("utf-8") if isinstance(name_node.text, bytes) else name_node.text
+                if name == class_name:
+                    body = node.child_by_field_name("body")
+                    if body and body.child_count > 0:
+                        first = body.children[0]
+                        if (first.type == "expression_statement"
+                                and first.child_count > 0
+                                and first.children[0].type == "string"):
+                            return first.end_point[0] + 1  # 1-indexed
+                    return None
+        for child in node.children:
+            result = _search(child)
+            if result is not None:
                 return result
         return None
 
@@ -739,24 +723,12 @@ def _has_error_nodes(node):
 def _syntax_check(filepath):
     """Check syntax of a file. Returns (ok, error_message).
 
-    Python -> ast.parse()
-    Other languages with tree-sitter -> parse and check for ERROR nodes
-    Unknown language or no tree-sitter -> skip (return success)
+    Uses tree-sitter to parse and check for ERROR nodes.
+    Unknown language or no tree-sitter -> skip (return success).
     """
     lang = detect_language(filepath)
-    if lang == "python" or lang is None:
-        # Python: use ast.parse; unknown extension: try as Python anyway
-        try:
-            ast.parse(open(filepath).read())
-            return (True, None)
-        except SyntaxError as e:
-            if lang == "python":
-                return (False, f"SyntaxError after edit: {e}")
-            # Unknown extension, syntax error is expected - skip
-            return (True, None)
-
-    if not _check_treesitter():
-        return (True, None)  # No tree-sitter, skip check
+    if lang is None or not _check_treesitter():
+        return (True, None)
 
     import tree_sitter_languages
     try:
@@ -896,50 +868,25 @@ def _exec_add_method(params):
         method_code += "\n"
 
     lang = detect_language(fp)
+    ts_info = _find_class_node_ts(fp, class_name)
+    if ts_info is None:
+        raise ValueError(f"Class '{class_name}' not found in {fp}")
 
-    if lang == "python" or lang is None:
-        # Use ast for Python
-        content = _read_file(fp)
-        tree = ast.parse(content)
-        lines = content.splitlines(keepends=True)
+    start_line, end_line, body_start = ts_info
+    lines = _read_lines(fp)
 
-        class_node = None
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == class_name:
-                class_node = node
-                break
-
-        if class_node is None:
-            raise ValueError(f"Class '{class_name}' not found in {fp}")
-
-        end_line = getattr(class_node, "end_lineno", None)
-        if end_line is None:
-            if class_node.body:
-                last_child = class_node.body[-1]
-                end_line = getattr(last_child, "end_lineno", last_child.lineno)
-            else:
-                end_line = class_node.lineno
-
-        insert_idx = end_line
+    if lang == "python":
+        # Indentation-based: insert after the last line of the class
+        insert_idx = end_line  # end_line is 1-indexed, so this is 0-indexed pos after
         lines.insert(insert_idx, "\n" + method_code)
-        _write_lines(fp, lines)
     else:
-        # Use tree-sitter for brace-based languages
-        ts_info = _find_class_node_ts(fp, class_name)
-        if ts_info is None:
-            raise ValueError(f"Class '{class_name}' not found in {fp}")
-
-        start_line, end_line, body_start = ts_info
-        lines = _read_lines(fp)
-
-        # For brace-based languages, find the closing brace and insert before it
-        # Search backwards from end_line for '}'
+        # Brace-based: find closing } and insert before it
         insert_idx = end_line - 1  # 0-indexed
         while insert_idx > 0 and '}' not in lines[insert_idx]:
             insert_idx -= 1
-
         lines.insert(insert_idx, "\n" + method_code)
-        _write_lines(fp, lines)
+
+    _write_lines(fp, lines)
 
 
 def _exec_add_import(params):
@@ -1032,42 +979,25 @@ def _exec_add_class_attribute(params):
         attr_code += "\n"
 
     lang = detect_language(fp)
+    ts_info = _find_class_node_ts(fp, class_name)
+    if ts_info is None:
+        raise ValueError(f"Class '{class_name}' not found in {fp}")
 
-    if lang == "python" or lang is None:
-        # Use ast for Python
-        content = _read_file(fp)
-        tree = ast.parse(content)
-        lines = content.splitlines(keepends=True)
+    start_line, end_line, body_start = ts_info
+    lines = _read_lines(fp)
 
-        class_node = None
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == class_name:
-                class_node = node
-                break
-
-        if class_node is None:
-            raise ValueError(f"Class '{class_name}' not found in {fp}")
-
-        insert_line = class_node.lineno
-        if (class_node.body and isinstance(class_node.body[0], ast.Expr)
-                and isinstance(class_node.body[0].value, (ast.Constant, ast.Str))):
-            docstring_end = getattr(class_node.body[0], "end_lineno", class_node.body[0].lineno)
-            insert_line = docstring_end
-
+    if lang == "python":
+        # Insert after class def line, skipping past any docstring
+        insert_line = _find_python_docstring_end_ts(fp, class_name)
+        if insert_line is None:
+            # No docstring — insert at body_start (before first body statement)
+            insert_line = body_start - 1  # convert to 0-indexed insert position
         lines.insert(insert_line, attr_code)
-        _write_lines(fp, lines)
     else:
-        # Use tree-sitter for brace-based languages
-        ts_info = _find_class_node_ts(fp, class_name)
-        if ts_info is None:
-            raise ValueError(f"Class '{class_name}' not found in {fp}")
-
-        start_line, end_line, body_start = ts_info
-        lines = _read_lines(fp)
-
-        # Insert right after the opening brace (body_start line)
+        # Brace-based: insert right after the opening brace
         lines.insert(body_start, attr_code)
-        _write_lines(fp, lines)
+
+    _write_lines(fp, lines)
 
 
 def _exec_replace_function_body(params):
@@ -1079,53 +1009,30 @@ def _exec_replace_function_body(params):
         new_body += "\n"
 
     lang = detect_language(fp)
+    ts_info = _find_function_node_ts(fp, func_name)
+    if ts_info is None:
+        raise ValueError(f"Function '{func_name}' not found in {fp}")
 
-    if lang == "python" or lang is None:
-        # Use ast for Python
-        content = _read_file(fp)
-        tree = ast.parse(content)
-        lines = content.splitlines(keepends=True)
+    start_line, end_line, body_start, body_end = ts_info
+    lines = _read_lines(fp)
 
-        func_node = None
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
-                func_node = node
-                break
-
-        if func_node is None:
-            raise ValueError(f"Function '{func_name}' not found in {fp}")
-
-        body_start = func_node.body[0].lineno - 1
-        body_end = getattr(func_node, "end_lineno", func_node.body[-1].lineno)
-
-        lines[body_start:body_end] = [new_body]
-        _write_lines(fp, lines)
+    if lang == "python":
+        # Indentation-based: body is from body_start to body_end (both 1-indexed)
+        # For Python tree-sitter, body is the block node containing all statements
+        lines[body_start - 1:body_end] = [new_body]
     else:
-        # Use tree-sitter for brace-based languages
-        ts_info = _find_function_node_ts(fp, func_name)
-        if ts_info is None:
-            raise ValueError(f"Function '{func_name}' not found in {fp}")
-
-        start_line, end_line, body_start, body_end = ts_info
-        lines = _read_lines(fp)
-
-        # For brace-based languages, replace content between { and }
-        # body_start is the line with '{', body_end is the line with '}'
-        # Replace lines between body_start and body_end (exclusive of braces)
+        # Brace-based: replace content between { and }
         brace_open_idx = body_start - 1  # 0-indexed
         brace_close_idx = body_end - 1  # 0-indexed
 
-        # Keep the opening brace line and closing brace line
-        # Replace everything between them
         if brace_open_idx == brace_close_idx:
             # Single-line body like { return x; }
-            # Rewrite as multi-line
             indent = "    "
             lines[brace_open_idx] = "{\n" + indent + new_body + "}\n"
         else:
             lines[brace_open_idx + 1:brace_close_idx] = [new_body]
 
-        _write_lines(fp, lines)
+    _write_lines(fp, lines)
 
 
 # ============================================================

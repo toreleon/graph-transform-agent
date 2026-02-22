@@ -424,8 +424,11 @@ def test_detect_language():
 
 
 def test_syntax_check_python():
-    """Verify Python syntax check via ast."""
+    """Verify Python syntax check via tree-sitter."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
     ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
     syntax_check = ns["_syntax_check"]
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -441,7 +444,7 @@ def test_syntax_check_python():
         f.flush()
         ok, err = syntax_check(f.name)
         assert ok is False
-        assert "SyntaxError" in err
+        assert "Parse error" in err
     os.unlink(f.name)
 
 
@@ -608,9 +611,12 @@ def test_install_treesitter_not_available(graphplan_config):
     assert any("pip install" in c for c in calls)
 
 
-def test_build_graph_dispatch_python_only():
-    """Verify build_graph uses ast for Python-only file lists."""
+def test_build_graph_dispatch_python():
+    """Verify build_graph uses tree-sitter for Python files."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")  # noqa: F841
+
     ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
 
     py_code = "class Foo:\n    pass\n"
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
