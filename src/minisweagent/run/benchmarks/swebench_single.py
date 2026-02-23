@@ -11,6 +11,7 @@ from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.models import get_model
 from minisweagent.run.benchmarks.swebench import (
     DATASET_MAPPING,
+    evaluate_submission,
     get_sb_environment,
 )
 from minisweagent.utils.log import logger
@@ -93,7 +94,10 @@ def main(
         config.get("agent", {}),
         default_type="interactive",
     )
-    agent.run(instance["problem_statement"])
+    info = agent.run(instance["problem_statement"])
+    submission = info.get("submission", "")
+    if submission and info.get("exit_status") == "Submitted":
+        evaluate_submission(env, instance, submission)
 
 
 if __name__ == "__main__":

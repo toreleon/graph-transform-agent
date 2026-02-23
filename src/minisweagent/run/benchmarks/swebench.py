@@ -16,6 +16,8 @@ import typer
 from jinja2 import StrictUndefined, Template
 from rich.live import Live
 
+from rich.console import Console
+
 from minisweagent import Environment
 from minisweagent.agents import get_agent_class
 from minisweagent.agents.default import DefaultAgent
@@ -25,6 +27,8 @@ from minisweagent.models import get_model
 from minisweagent.run.benchmarks.utils.batch_progress import RunBatchProgressManager
 from minisweagent.utils.log import add_file_handler, logger
 from minisweagent.utils.serialize import UNSET, recursive_merge
+
+_console = Console(highlight=False)
 
 _HELP_TEXT = """Run mini-SWE-agent on SWEBench instances.
 
@@ -143,6 +147,121 @@ def remove_from_preds_file(output_path: Path, instance_id: str):
             output_path.write_text(json.dumps(output_data, indent=2))
 
 
+def evaluate_submission(env: Environment, instance: dict, submission: str) -> dict | None:
+    """Run FAIL_TO_PASS and PASS_TO_PASS tests after the agent has finished.
+
+    This is a post-task evaluation only -- results are logged but never fed
+    back to the agent.
+
+    Returns a results dict or None if tests could not be run.
+    """
+    fail_to_pass_raw = instance.get("FAIL_TO_PASS", "[]")
+    pass_to_pass_raw = instance.get("PASS_TO_PASS", "[]")
+
+    try:
+        fail_to_pass = json.loads(fail_to_pass_raw) if isinstance(fail_to_pass_raw, str) else fail_to_pass_raw
+        pass_to_pass = json.loads(pass_to_pass_raw) if isinstance(pass_to_pass_raw, str) else pass_to_pass_raw
+    except json.JSONDecodeError:
+        logger.warning("Could not parse test lists for %s", instance.get("instance_id", "?"))
+        return None
+
+    if not fail_to_pass:
+        logger.info("No FAIL_TO_PASS tests for %s, skipping evaluation", instance.get("instance_id", "?"))
+        return None
+
+    _console.print(f"\n  [bold cyan]POST-TASK TEST EVALUATION[/bold cyan]  "
+                    f"({len(fail_to_pass)} fail_to_pass, {len(pass_to_pass)} pass_to_pass)")
+
+    try:
+        # Reset to clean state and apply the submission patch
+        env.execute({"command": "cd /testbed && git checkout -- . && git clean -fd"})
+        env.execute({"command": f"cat > /tmp/eval_patch.diff << 'EVAL_EOF'\n{submission}\nEVAL_EOF"})
+        apply_result = env.execute({"command": "cd /testbed && git apply /tmp/eval_patch.diff 2>&1"})
+        if apply_result.get("returncode", -1) != 0:
+            _console.print(f"  [red]FAIL[/red]  Could not apply patch: {apply_result.get('output', '')[:200]}")
+            return None
+
+        # Apply test_patch if present (some instances need test file changes)
+        test_patch = instance.get("test_patch", "")
+        if test_patch:
+            env.execute({"command": f"cat > /tmp/test_patch.diff << 'TEST_EOF'\n{test_patch}\nTEST_EOF"})
+            tp_result = env.execute({"command": "cd /testbed && git apply /tmp/test_patch.diff 2>&1"})
+            if tp_result.get("returncode", -1) != 0:
+                _console.print(f"  [yellow]WARN[/yellow]  test_patch failed to apply (may already be present)")
+
+        # Run FAIL_TO_PASS tests
+        _console.print(f"\n  [bold]FAIL_TO_PASS tests ({len(fail_to_pass)}):[/bold]")
+        f2p_passed = 0
+        f2p_failed = []
+        for test_id in fail_to_pass:
+            passed = _run_single_test(env, test_id)
+            if passed:
+                f2p_passed += 1
+                _console.print(f"    [green]PASS[/green]  {test_id}")
+            else:
+                f2p_failed.append(test_id)
+                _console.print(f"    [red]FAIL[/red]  {test_id}")
+
+        # Run PASS_TO_PASS tests
+        p2p_passed = 0
+        p2p_failed = []
+        p2p_total = len(pass_to_pass)
+        if p2p_total > 0:
+            _console.print(f"\n  [bold]PASS_TO_PASS tests ({p2p_total}):[/bold]")
+            for test_id in pass_to_pass:
+                passed = _run_single_test(env, test_id)
+                if passed:
+                    p2p_passed += 1
+                    _console.print(f"    [green]PASS[/green]  {test_id}")
+                else:
+                    p2p_failed.append(test_id)
+                    _console.print(f"    [red]FAIL[/red]  {test_id}")
+
+        # Summary
+        f2p_pct = (f2p_passed / len(fail_to_pass) * 100) if fail_to_pass else 0
+        p2p_pct = (p2p_passed / p2p_total * 100) if p2p_total > 0 else 100
+        all_passed = f2p_pct == 100 and p2p_pct == 100
+
+        _console.print()
+        _console.print(f"  [bold]FAIL_TO_PASS:[/bold] {f2p_passed}/{len(fail_to_pass)} ({f2p_pct:.0f}%)")
+        _console.print(f"  [bold]PASS_TO_PASS:[/bold] {p2p_passed}/{p2p_total} ({p2p_pct:.0f}%)")
+
+        if all_passed:
+            _console.print(f"\n  [green bold]RESOLVED[/green bold]  All tests pass!")
+        elif f2p_pct > 0 and p2p_pct == 100:
+            _console.print(f"\n  [yellow bold]PARTIAL[/yellow bold]  Some FAIL_TO_PASS tests still failing")
+        else:
+            _console.print(f"\n  [red bold]NOT RESOLVED[/red bold]  Tests failing")
+
+        return {
+            "all_passed": all_passed,
+            "f2p_passed": f2p_passed,
+            "f2p_total": len(fail_to_pass),
+            "f2p_failed": f2p_failed,
+            "p2p_passed": p2p_passed,
+            "p2p_total": p2p_total,
+            "p2p_failed": p2p_failed,
+        }
+    except Exception as e:
+        logger.warning("Test evaluation error for %s: %s", instance.get("instance_id", "?"), e)
+        return None
+
+
+def _run_single_test(env: Environment, test_id: str, timeout: int = 120) -> bool:
+    """Run a single test in the environment. Returns True if passed."""
+    result = env.execute({
+        "command": f"cd /testbed && python -m pytest -xvs {test_id} 2>&1 | tail -20",
+        "timeout": timeout,
+    })
+    output = result.get("output", "")
+    rc = result.get("returncode", -1)
+    if rc == 0:
+        return True
+    if " passed" in output and " failed" not in output and " error" not in output.lower():
+        return True
+    return False
+
+
 def process_instance(
     instance: dict,
     output_dir: Path,
@@ -182,6 +301,12 @@ def process_instance(
         info = agent.run(task)
         exit_status = info.get("exit_status")
         result = info.get("submission")
+        # Post-task test evaluation (agent is done, results are only logged)
+        if result and exit_status == "Submitted":
+            progress_manager.update_instance_status(instance_id, "Evaluating tests")
+            test_results = evaluate_submission(env, instance, result)
+            if test_results:
+                extra_info["test_results"] = test_results
     except Exception as e:
         logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
         exit_status, result = type(e).__name__, ""
