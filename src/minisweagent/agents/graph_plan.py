@@ -62,8 +62,6 @@ class GraphPlanAgentConfig(AgentConfig):
     """Maximum number of steps for the exploration phase."""
     max_plan_revisions: int = 3
     """Maximum number of plan revision attempts before fallback."""
-    max_test_retries: int = 2
-    """Maximum number of retry attempts when SWE-bench tests fail after submission."""
 
 
 class GraphPlanAgent(DefaultAgent):
@@ -74,7 +72,6 @@ class GraphPlanAgent(DefaultAgent):
         self._scripts_deployed = False
         self._treesitter_installed = False
         self._current_phase = "init"
-        self._instance_data: dict = {}  # SWE-bench instance data for test evaluation
         self._plan_info: dict = {}  # Saved plan data for trajectory
 
     def serialize(self, *extra_dicts) -> dict:
@@ -118,16 +115,12 @@ class GraphPlanAgent(DefaultAgent):
             label += f"- {detail} "
         _console.print(Rule(label, style="cyan bold"))
 
-    def run(self, task="", *, instance: dict | None = None, **kwargs) -> dict:
+    def run(self, task="", **kwargs) -> dict:
         """Run the agent with phased approach: explore -> plan -> execute.
 
         Args:
             task: The problem statement / task description.
-            instance: Optional SWE-bench instance dict with FAIL_TO_PASS,
-                      PASS_TO_PASS, and test_patch fields for post-run evaluation.
         """
-        if instance:
-            self._instance_data = instance
         self.extra_template_vars |= {"task": task, **kwargs}
         self.messages = []
         self.add_messages(
@@ -713,7 +706,7 @@ class GraphPlanAgent(DefaultAgent):
         return self.messages[-1].get("extra", {})
 
     def _verify_submission(self, info: dict) -> dict:
-        """Print a post-run summary and verify the submission with SWE-bench tests."""
+        """Print a post-run summary and verify submission patch format."""
         self._print_phase("RESULT", "verifying submission")
 
         exit_status = info.get("exit_status", "unknown")
@@ -783,15 +776,6 @@ class GraphPlanAgent(DefaultAgent):
             for line in lines[-10:]:
                 _console.print(f"  {line}", highlight=False, markup=False)
 
-        # Run SWE-bench test evaluation if instance data is available
-        if self._instance_data:
-            test_results = self._run_swebench_tests(submission)
-            # If tests failed and we have retries left, let agent fix
-            if test_results and not test_results["all_passed"]:
-                info = self._test_retry_loop(info, test_results)
-        else:
-            _console.print(f"\n  [dim]SKIP  SWE-bench test eval (no instance data)[/dim]")
-
         if all_passed:
             _console.print(f"\n  [green bold]OK:[/green bold] Submission looks valid ({sub_bytes} bytes)")
         else:
@@ -799,190 +783,3 @@ class GraphPlanAgent(DefaultAgent):
 
         return info
 
-    def _test_retry_loop(self, info: dict, test_results: dict) -> dict:
-        """Let the agent retry editing when tests fail after submission.
-
-        Restores the agent's working state, injects failure feedback,
-        and runs a step loop so the agent can fix and resubmit.
-        """
-        max_retries = self.config.max_test_retries
-        for attempt in range(max_retries):
-            submission = info.get("submission", "")
-            if not submission:
-                break
-
-            # Restore the agent's working state: reset + re-apply patch
-            self._print_phase("RETRY", f"fixing test failures (attempt {attempt + 1}/{max_retries})")
-            self.env.execute({"command": "cd /testbed && git checkout -- . && git clean -fd"})
-            self.env.execute({"command": f"cat > /tmp/retry_patch.diff << 'RETRY_EOF'\n{submission}\nRETRY_EOF"})
-            apply = self.env.execute({"command": "cd /testbed && git apply /tmp/retry_patch.diff 2>&1"})
-            if apply.get("returncode", -1) != 0:
-                _console.print(f"  [red]Cannot re-apply patch for retry: {apply.get('output', '')[:200]}[/red]")
-                break
-
-            # Build failure feedback message
-            failed_tests = test_results.get("f2p_failed", []) + test_results.get("p2p_failed", [])
-            feedback_lines = [
-                "Your submission was tested but some tests FAILED.",
-                "Please fix the issues and resubmit.",
-                "",
-                "Failed tests:",
-            ]
-            for test_id in failed_tests:
-                feedback_lines.append(f"  - {test_id}")
-            feedback_lines.append("")
-            feedback_lines.append(
-                "Your patch has been re-applied to /testbed. "
-                "You can run the failing tests to see the errors, "
-                "then make corrections and resubmit with:\n"
-                "  git diff -- <files> > patch.txt\n"
-                "  echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt"
-            )
-
-            self.add_messages(self.model.format_message(
-                role="user", content="\n".join(feedback_lines)
-            ))
-
-            # Step loop until agent resubmits
-            while True:
-                try:
-                    self.step()
-                except InterruptAgentFlow as e:
-                    self.add_messages(*e.messages)
-                except Exception as e:
-                    self.handle_uncaught_exception(e)
-                    raise
-                finally:
-                    self.save(self.config.output_path)
-                if self.messages[-1].get("role") == "exit":
-                    break
-
-            info = self.messages[-1].get("extra", {})
-            new_submission = info.get("submission", "")
-            if not new_submission:
-                _console.print("[yellow]Agent did not resubmit after retry[/yellow]")
-                break
-
-            # Re-test
-            test_results = self._run_swebench_tests(new_submission)
-            if not test_results or test_results["all_passed"]:
-                break
-
-        return info
-
-    def _run_swebench_tests(self, submission: str) -> dict | None:
-        """Run FAIL_TO_PASS and PASS_TO_PASS tests inside the container.
-
-        Returns a results dict with keys:
-            all_passed, f2p_passed, f2p_total, f2p_failed,
-            p2p_passed, p2p_total, p2p_failed
-        Or None if tests could not be run.
-        """
-        fail_to_pass_raw = self._instance_data.get("FAIL_TO_PASS", "[]")
-        pass_to_pass_raw = self._instance_data.get("PASS_TO_PASS", "[]")
-
-        try:
-            fail_to_pass = json.loads(fail_to_pass_raw) if isinstance(fail_to_pass_raw, str) else fail_to_pass_raw
-            pass_to_pass = json.loads(pass_to_pass_raw) if isinstance(pass_to_pass_raw, str) else pass_to_pass_raw
-        except json.JSONDecodeError:
-            _console.print(f"  [yellow]WARN[/yellow]  Could not parse test lists")
-            return None
-
-        if not fail_to_pass:
-            _console.print(f"  [dim]SKIP  No FAIL_TO_PASS tests in instance data[/dim]")
-            return None
-
-        self._print_phase("TEST EVAL", f"{len(fail_to_pass)} fail_to_pass, {len(pass_to_pass)} pass_to_pass")
-
-        try:
-            # Reset to clean state and apply the patch
-            _console.print(f"  [dim]Resetting to base commit and applying patch...[/dim]")
-            self.env.execute({"command": "cd /testbed && git checkout -- . && git clean -fd"})
-            self.env.execute({"command": f"cat > /tmp/eval_patch.diff << 'EVAL_EOF'\n{submission}\nEVAL_EOF"})
-            apply_result = self.env.execute({"command": "cd /testbed && git apply /tmp/eval_patch.diff 2>&1"})
-            if apply_result.get("returncode", -1) != 0:
-                _console.print(f"  [red]FAIL[/red]  Could not apply patch: {apply_result.get('output', '')[:200]}")
-                return None
-
-            # Apply test_patch if present (some instances need test changes)
-            test_patch = self._instance_data.get("test_patch", "")
-            if test_patch:
-                self.env.execute({"command": f"cat > /tmp/test_patch.diff << 'TEST_EOF'\n{test_patch}\nTEST_EOF"})
-                tp_result = self.env.execute({"command": "cd /testbed && git apply /tmp/test_patch.diff 2>&1"})
-                if tp_result.get("returncode", -1) != 0:
-                    _console.print(f"  [yellow]WARN[/yellow]  test_patch failed to apply (may already be present)")
-
-            # Run FAIL_TO_PASS tests
-            _console.print(f"\n  [bold]FAIL_TO_PASS tests ({len(fail_to_pass)}):[/bold]")
-            f2p_passed = 0
-            f2p_failed = []
-            for test_id in fail_to_pass:
-                result = self._run_single_test(test_id)
-                if result:
-                    f2p_passed += 1
-                    _console.print(f"    [green]PASS[/green]  {test_id}")
-                else:
-                    f2p_failed.append(test_id)
-                    _console.print(f"    [red]FAIL[/red]  {test_id}")
-
-            # Run ALL PASS_TO_PASS tests
-            p2p_passed = 0
-            p2p_failed = []
-            p2p_total = len(pass_to_pass)
-            if p2p_total > 0:
-                _console.print(f"\n  [bold]PASS_TO_PASS tests ({p2p_total}):[/bold]")
-                for test_id in pass_to_pass:
-                    result = self._run_single_test(test_id)
-                    if result:
-                        p2p_passed += 1
-                        _console.print(f"    [green]PASS[/green]  {test_id}")
-                    else:
-                        p2p_failed.append(test_id)
-                        _console.print(f"    [red]FAIL[/red]  {test_id}")
-
-            # Resolution status
-            _console.print()
-            f2p_pct = (f2p_passed / len(fail_to_pass) * 100) if fail_to_pass else 0
-            p2p_pct = (p2p_passed / p2p_total * 100) if p2p_total > 0 else 100
-
-            _console.print(f"  [bold]FAIL_TO_PASS:[/bold] {f2p_passed}/{len(fail_to_pass)} ({f2p_pct:.0f}%)")
-            _console.print(f"  [bold]PASS_TO_PASS:[/bold] {p2p_passed}/{p2p_total} ({p2p_pct:.0f}%)")
-
-            all_passed = f2p_pct == 100 and p2p_pct == 100
-            if all_passed:
-                _console.print(f"\n  [green bold]RESOLVED[/green bold]  All tests pass!")
-            elif f2p_pct > 0 and p2p_pct == 100:
-                _console.print(f"\n  [yellow bold]PARTIAL[/yellow bold]  Some FAIL_TO_PASS tests still failing")
-            else:
-                _console.print(f"\n  [red bold]NOT RESOLVED[/red bold]  Tests failing")
-
-            return {
-                "all_passed": all_passed,
-                "f2p_passed": f2p_passed,
-                "f2p_total": len(fail_to_pass),
-                "f2p_failed": f2p_failed,
-                "p2p_passed": p2p_passed,
-                "p2p_total": p2p_total,
-                "p2p_failed": p2p_failed,
-            }
-
-        except Exception as e:
-            _console.print(f"  [yellow]WARN[/yellow]  Test evaluation error: {e}")
-            return None
-
-    def _run_single_test(self, test_id: str, timeout: int = 120) -> bool:
-        """Run a single test in the container. Returns True if passed."""
-        # Handle both pytest-style (file::class::method) and unittest-style test IDs
-        result = self.env.execute({
-            "command": f"cd /testbed && python -m pytest -xvs {test_id} 2>&1 | tail -20",
-            "timeout": timeout,
-        })
-        output = result.get("output", "")
-        rc = result.get("returncode", -1)
-        # pytest returns 0 on all pass, 1 on failures
-        if rc == 0:
-            return True
-        # Also check output for "passed" in case returncode is unreliable
-        if " passed" in output and " failed" not in output and " error" not in output.lower():
-            return True
-        return False

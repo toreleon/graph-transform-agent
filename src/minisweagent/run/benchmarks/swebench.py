@@ -179,7 +179,7 @@ def process_instance(
             instance_id=instance_id,
             **agent_config,
         )
-        info = agent.run(task, instance=instance)
+        info = agent.run(task)
         exit_status = info.get("exit_status")
         result = info.get("submission")
     except Exception as e:

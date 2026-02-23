@@ -76,7 +76,6 @@ def test_graphplan_config_defaults():
     )
     assert config.max_explore_steps == 30
     assert config.max_plan_revisions == 3
-    assert config.max_test_retries == 2
 
 
 def test_ready_to_plan_pattern():

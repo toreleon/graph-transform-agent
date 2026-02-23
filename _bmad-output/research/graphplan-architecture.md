@@ -8,8 +8,7 @@ GraphPlan is an operator-based code editing agent for SWE-bench. Instead of havi
 2. Has the LLM select from a catalog of **10 typed edit operators** with defined parameters
 3. **Verifies** the plan against the graph before execution via a **7-layer verification system** (schema validation, content existence, line drift, AST context, scope analysis, preflight syntax, cross-file impact)
 4. Executes operators with **postcondition validation** (language-aware syntax checking after each step)
-5. Runs **SWE-bench tests** post-submission with automatic retry on failure
-6. Falls back gracefully to a standard step loop if any phase fails
+5. Falls back gracefully to a standard step loop if any phase fails
 
 The key insight: constraining the LLM to structured operators with verifiable preconditions catches errors *before* they corrupt the codebase, while the graph provides the LLM with a compact structural view it can reason about precisely.
 
@@ -36,9 +35,8 @@ graph TB
         Verify["VERIFY<br/>check preconditions<br/>against graph"]
         Exec["EXECUTE<br/>apply operators<br/>+ syntax check"]
         Submit["SUBMIT<br/>review + patch<br/>git diff"]
-        Test["TEST + RETRY<br/>SWE-bench tests<br/>+ retry loop"]
 
-        Graph --> Plan --> Verify --> Exec --> Submit --> Test
+        Graph --> Plan --> Verify --> Exec --> Submit
     end
 
     subgraph Fallback ["Fallback: Step Loop"]
@@ -57,7 +55,7 @@ graph TB
 
 | File | Location | Purpose |
 |------|----------|---------|
-| `graph_plan.py` | `src/minisweagent/agents/` | Agent class, phase orchestration, test evaluation |
+| `graph_plan.py` | `src/minisweagent/agents/` | Agent class, phase orchestration |
 | `graph_plan_scripts.py` | `src/minisweagent/agents/` | Helper script (runs inside Docker) |
 | `swebench_graphplan.yaml` | `src/minisweagent/config/benchmarks/` | Benchmark configuration |
 
@@ -68,8 +66,6 @@ sequenceDiagram
     participant Agent as GraphPlanAgent
     participant LLM as LLM (gpt-5-mini)
     participant Docker as Docker Container
-    participant Tests as SWE-bench Tests
-
     Note over Agent,Docker: Setup
     Agent->>Docker: Install tree-sitter-languages
     Agent->>Docker: Deploy graphplan_helper.py
@@ -108,23 +104,7 @@ sequenceDiagram
     Agent->>LLM: Review changes prompt
     LLM-->>Agent: git diff > patch.txt + submit
     Agent->>Docker: Execute submission
-
-    Note over Agent,Tests: Phase 7: TEST + RETRY
-    Agent->>Docker: Reset + apply patch
-    Agent->>Tests: Run FAIL_TO_PASS tests
-    Tests-->>Agent: Results
-    Agent->>Tests: Run PASS_TO_PASS tests
-    Tests-->>Agent: Results
-    alt All pass
-        Agent-->>Agent: RESOLVED
-    else Tests fail
-        loop Retry (max 2)
-            Agent->>Docker: Re-apply patch
-            Agent->>LLM: Failure feedback
-            LLM-->>Agent: Fix + resubmit
-            Agent->>Tests: Re-test
-        end
-    end
+    Agent->>Agent: Verify patch format
 ```
 
 ## Phase 1: Code Graph Construction
@@ -1238,7 +1218,7 @@ The system catches the most common failure modes before any files are modified:
 - **Syntax-breaking replacement** (Layer 5) -- caught before writing to disk
 - **Cross-file breakage** (Layer 6) -- warned before execution
 
-The test retry loop serves as the final safety net -- if the edit is semantically wrong, the tests will catch it.
+Behavioral correctness (whether the fix actually solves the bug) can only be verified by running tests externally after the agent finishes.
 
 ## Phase 4: Execution with Postcondition Validation
 
@@ -1279,52 +1259,16 @@ flowchart TD
     Pop2 --> FallbackLoop[Fall back to step loop]
 ```
 
-## Phase 5: Post-Submission Test Evaluation and Retry
+## Phase 5: Post-Submission Patch Verification
 
-### Patch Format Checks
-
-After submission, the agent verifies patch format:
+After submission, the agent verifies patch format (without running any tests):
 - `diff --git` header present
 - `--- a/` and `+++ b/` markers present
 - `@@` hunk markers present
 - Contains actual additions (`+` lines)
 - `git apply --check` passes (dry-run)
 
-### SWE-bench Test Evaluation
-
-If instance data is provided (with `FAIL_TO_PASS` and `PASS_TO_PASS` test lists):
-
-1. Reset to clean state: `git checkout -- . && git clean -fd`
-2. Apply the model's patch: `git apply /tmp/eval_patch.diff`
-3. Apply test_patch if present (some instances need test changes)
-4. Run **all** FAIL_TO_PASS tests: `python -m pytest -xvs <test_id>`
-5. Run **all** PASS_TO_PASS tests (no sampling)
-6. Report resolution status:
-   - **RESOLVED**: F2P=100% AND P2P=100%
-   - **PARTIAL**: 0% < F2P < 100% AND P2P=100%
-   - **NOT RESOLVED**: F2P=0% or P2P<100%
-
-### Test Retry Loop
-
-When tests fail after submission, the agent can automatically retry. The `_test_retry_loop` method:
-
-```
-for attempt in range(max_test_retries):    # default: 2
-    1. Restore working state:
-       - git checkout -- . && git clean -fd
-       - Re-apply the submitted patch
-    2. Inject failure feedback:
-       "Your submission was tested but some tests FAILED.
-        Failed tests:
-          - tests/test_foo.py::TestBar::test_baz
-          - tests/test_foo.py::TestBar::test_qux
-        Your patch has been re-applied. Fix and resubmit."
-    3. Run step loop until agent resubmits
-    4. Re-test the new submission
-    5. Break if all pass
-```
-
-This gives the agent a chance to see actual test failures and fix its solution, turning what would be a hard failure into a recoverable situation.
+Test evaluation (FAIL_TO_PASS / PASS_TO_PASS) is performed externally by the SWE-bench evaluation harness after the agent has finished. The agent never sees test results during its run.
 
 ## Invariants Maintained Throughout
 
@@ -1383,33 +1327,11 @@ flowchart TD
         S1[git diff] --> S2[Patch format check] --> S3[git apply --check]
     end
 
-    Submit --> TestEval
-
-    subgraph TestEval ["Test Evaluation"]
-        T1["Run FAIL_TO_PASS<br/><i>all tests</i>"]
-        T2["Run PASS_TO_PASS<br/><i>all tests</i>"]
-        T1 --> T2
-    end
-
-    TestEval -->|ALL PASS| Resolved([RESOLVED])
-    TestEval -->|FAIL| Retry
-
-    subgraph Retry ["Test Retry Loop"]
-        R1[Restore working state<br/><i>reset + re-apply patch</i>]
-        R2[Inject failure feedback<br/><i>list failed tests</i>]
-        R3[Agent step loop<br/><i>fix + resubmit</i>]
-        R1 --> R2 --> R3
-    end
-
-    Retry -->|Resubmit| TestEval
-    Retry -->|"max_test_retries<br/>exceeded"| Done([Done with failures])
+    Submit --> Done([Done])
 
     style Verify fill:#2a1a3a,stroke:#6a2daa
     style Exec fill:#1a2a3a,stroke:#2d4f6a
     style Submit fill:#1a3a2a,stroke:#2d6a4f
-    style TestEval fill:#3a3a1a,stroke:#6a6a2d
-    style Retry fill:#3a1a1a,stroke:#6a2d2d
-    style Resolved fill:#1a5a1a,stroke:#2d8a2d
 ```
 
 ## Graceful Degradation
@@ -1420,7 +1342,7 @@ GraphPlan falls back to a standard step loop (DefaultAgent behavior) at multiple
 flowchart LR
     subgraph HappyPath ["Happy Path"]
         direction LR
-        HP1[EXPLORE] --> HP2[GRAPH] --> HP3[PLAN] --> HP4[VERIFY] --> HP5[EXECUTE] --> HP6[SUBMIT] --> HP7[TEST]
+        HP1[EXPLORE] --> HP2[GRAPH] --> HP3[PLAN] --> HP4[VERIFY] --> HP5[EXECUTE] --> HP6[SUBMIT]
     end
 
     HP1 -->|"max_explore_steps<br/>exhausted"| FB([Fallback:<br/>Step Loop])
@@ -1442,7 +1364,6 @@ agent:
   agent_class: graphplan
   max_explore_steps: 30    # Max steps for file discovery
   max_plan_revisions: 3    # Max plan revision attempts
-  max_test_retries: 2      # Max retry attempts when tests fail
   step_limit: 250          # Overall step limit
   cost_limit: 3.0          # Dollar cost limit
 ```
