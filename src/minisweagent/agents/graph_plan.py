@@ -13,6 +13,8 @@ import json
 import logging
 import re
 import shlex
+import subprocess
+import tempfile
 
 from rich.console import Console
 from rich.rule import Rule
@@ -286,11 +288,35 @@ class GraphPlanAgent(DefaultAgent):
         if self._scripts_deployed:
             return
         self._install_treesitter()
-        result = self.env.execute({"command": f"cat > /tmp/graphplan_helper.py << 'GRAPHPLAN_EOF'\n{HELPER_SCRIPT}\nGRAPHPLAN_EOF"})
-        if result.get("returncode", -1) != 0:
-            logger.warning(f"Failed to deploy helper script: {result.get('output', '')[:200]}")
-        else:
-            self._scripts_deployed = True
+        # Use docker cp to avoid 'argument list too long' error for large scripts.
+        # The HELPER_SCRIPT can exceed ARG_MAX when passed via shell heredoc.
+        container_id = getattr(self.env, "container_id", None)
+        docker_exe = getattr(getattr(self.env, "config", None), "executable", "docker")
+        if container_id:
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+                    f.write(HELPER_SCRIPT)
+                    tmp_path = f.name
+                subprocess.run(
+                    [docker_exe, "cp", tmp_path, f"{container_id}:/tmp/graphplan_helper.py"],
+                    capture_output=True, text=True, timeout=30, check=True,
+                )
+                import os
+                os.unlink(tmp_path)
+                self._scripts_deployed = True
+                return
+            except Exception as e:
+                logger.warning(f"docker cp failed ({e}), falling back to chunked write")
+        # Fallback: write in chunks via shell to stay under ARG_MAX
+        chunk_size = 48000  # well under typical 128KB ARG_MAX
+        for i in range(0, len(HELPER_SCRIPT), chunk_size):
+            chunk = HELPER_SCRIPT[i:i + chunk_size].replace("'", "'\\''")
+            op = ">" if i == 0 else ">>"
+            result = self.env.execute({"command": f"printf '%s' '{chunk}' {op} /tmp/graphplan_helper.py"})
+            if result.get("returncode", -1) != 0:
+                logger.warning(f"Failed to deploy helper script chunk: {result.get('output', '')[:200]}")
+                return
+        self._scripts_deployed = True
 
     def _explore_phase(self) -> list[str]:
         """Run step() in a loop for exploration. Returns file list or empty.
@@ -355,14 +381,16 @@ class GraphPlanAgent(DefaultAgent):
         inner = match.group(1).strip()
         if not inner:
             return []
+        # Strip escaped quotes that LLMs sometimes produce (e.g., \"file.py\")
+        cleaned = inner.replace('\\"', '"').replace("\\'", "'")
         try:
             # Try JSON parse first
-            files = json.loads("[" + inner + "]")
+            files = json.loads("[" + cleaned + "]")
             return [f.strip() for f in files if isinstance(f, str) and f.strip()]
         except json.JSONDecodeError:
-            # Fallback: split by comma, strip quotes
-            parts = inner.split(",")
-            return [p.strip().strip("'\"") for p in parts if p.strip().strip("'\"")]
+            # Fallback: split by comma, strip quotes and backslashes
+            parts = cleaned.split(",")
+            return [p.strip().strip("'\"\\") for p in parts if p.strip().strip("'\"\\")]
 
     def _build_code_graph(self, files: list[str]) -> tuple[str, str]:
         """Build code graph from files. Returns (graph_json, graph_view)."""
