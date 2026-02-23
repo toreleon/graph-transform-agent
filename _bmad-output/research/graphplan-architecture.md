@@ -5,12 +5,15 @@
 GraphPlan is an operator-based code editing agent for SWE-bench. Instead of having the LLM generate free-form text patches (which are brittle and error-prone), GraphPlan:
 
 1. Builds a **structural code graph** from target files using **tree-sitter** (10 languages supported)
-2. Has the LLM select from a catalog of **10 typed edit operators** with defined parameters
-3. **Verifies** the plan against the graph before execution via a **7-layer verification system** (schema validation, content existence, line drift, AST context, scope analysis, preflight syntax, cross-file impact)
-4. Executes operators with **postcondition validation** (language-aware syntax checking after each step)
+2. Has the LLM select from **AST-node transformation primitives** that locate targets structurally via tree-sitter locators (no line numbers needed), plus **composed operators** (built-in and LLM-defined) for common patterns
+3. **Verifies** the plan against the graph before execution via a **7-layer verification system** including locator-based precondition checking
+4. Executes primitives with **per-primitive rollback** (pre-check → edit → post-check → rollback on failure) plus **postcondition validation** (language-aware syntax checking)
 5. Falls back gracefully to a standard step loop if any phase fails
+6. Supports **self-evolving operators**: the LLM can define custom composed operators at plan time via a JSON DSL
 
-The key insight: constraining the LLM to structured operators with verifiable preconditions catches errors *before* they corrupt the codebase, while the graph provides the LLM with a compact structural view it can reason about precisely.
+The key insight: constraining the LLM to structural primitives with AST-based locators eliminates line-drift issues, while per-primitive rollback ensures the codebase is never left in an invalid state. The locator system re-queries the live AST on every step, so each primitive operates on the current state of the code, not stale line numbers.
+
+> **Legacy support**: The original 10 string/line-based operators are still available for backward compatibility but are superseded by the primitive system.
 
 ## System Architecture
 
@@ -31,9 +34,9 @@ graph TB
     subgraph PlanExec ["Phase 2: PLAN + EXEC"]
         direction TB
         Graph["GRAPH<br/>tree-sitter parse<br/>symbols + imports"]
-        Plan["PLAN<br/>LLM generates<br/>JSON operators"]
-        Verify["VERIFY<br/>check preconditions<br/>against graph"]
-        Exec["EXECUTE<br/>apply operators<br/>+ syntax check"]
+        Plan["PLAN<br/>LLM generates JSON:<br/>primitives + locators<br/>+ custom operators"]
+        Verify["VERIFY<br/>locator-based<br/>precondition checks"]
+        Exec["EXECUTE<br/>per-primitive rollback<br/>+ syntax check"]
         Submit["SUBMIT<br/>review + patch<br/>git diff"]
 
         Graph --> Plan --> Verify --> Exec --> Submit
@@ -267,303 +270,357 @@ FILE: src/marshmallow/schema.py
 
 This gives the LLM precise structural information (class names, function boundaries, import locations) without sending the entire source code. The LLM already read the source during the explore phase -- the graph view provides a structural map for planning.
 
-## Phase 2: Edit Operators
+## Phase 2: AST-Node Transformation Primitives
 
-### Operator Catalog
+### Architecture Overview
 
-10 operators in two tiers. Each operator is a self-contained file transformation: read file, apply change, write file, syntax check.
+The edit system has three layers:
 
-#### Tier 1: Essential Operators
-
-##### `replace_code` -- String Find-and-Replace
-
-The workhorse operator. Handles the majority of fixes (single-point mutations, guard clause additions, condition changes).
-
-| | |
-|---|---|
-| **Parameters** | `file` (path), `pattern` (exact string to find), `replacement` (string to substitute) |
-| **Mechanism** | `content.replace(pattern, replacement, 1)` -- first occurrence only |
-| **Precondition** | `pattern` must exist verbatim in the file content |
-| **Runtime error** | `ValueError("Pattern not found in {file}: {pattern[:80]}")` |
-| **Edge cases** | Pattern matching is literal (no regex). Newlines in pattern/replacement must use `\n`. Only replaces the *first* occurrence -- if the same pattern appears multiple times, subsequent occurrences require additional steps. |
-
-```json
-{"op": "replace_code", "params": {
-  "file": "src/schema.py",
-  "pattern": "for attr_name in self.__processors__",
-  "replacement": "if data is None:\n            return\n        for attr_name in self.__processors__"
-}}
-```
-
-##### `insert_code` -- Line-Anchored Insertion
-
-Inserts code before or after a specific line number. Useful when the insertion point is known precisely from the graph view.
-
-| | |
-|---|---|
-| **Parameters** | `file` (path), `anchor_line` (1-indexed), `position` (`"before"` or `"after"`), `code` (string to insert) |
-| **Mechanism** | `lines.insert(idx, code)` at `anchor - 1` (before) or `anchor` (after) |
-| **Precondition** | `anchor_line` must be in range `[1, num_lines]` |
-| **Runtime error** | `ValueError("anchor_line {n} out of range (1-{total})")` |
-| **Edge cases** | Trailing newline is auto-appended if missing. Position defaults to `"after"` if omitted. |
-
-```json
-{"op": "insert_code", "params": {
-  "file": "src/query.py", "anchor_line": 847, "position": "after",
-  "code": "    self._clear_cache()"
-}}
-```
-
-##### `delete_lines` -- Range Deletion
-
-Removes a contiguous range of lines. Both endpoints are inclusive and 1-indexed.
-
-| | |
-|---|---|
-| **Parameters** | `file` (path), `start_line` (1-indexed), `end_line` (1-indexed, inclusive) |
-| **Mechanism** | `del lines[start-1 : end]` |
-| **Precondition** | `start_line <= end_line`, both in range `[1, num_lines]` |
-| **Runtime error** | `ValueError("Line range {s}-{e} out of bounds (1-{total})")` |
-
-```json
-{"op": "delete_lines", "params": {
-  "file": "src/query.py", "start_line": 50, "end_line": 53
-}}
-```
-
-##### `add_method` -- Tree-Sitter-Guided Class Insertion
-
-Adds a method to an existing class. Uses `_find_class_node_ts()` to locate the class boundaries via tree-sitter, then dispatches by language paradigm.
-
-| | |
-|---|---|
-| **Parameters** | `file` (path), `class_name` (exact name), `method_code` (full method source with indentation) |
-| **Mechanism** | **Python**: insert after last line of class body. **Brace-based**: scan backward from `end_line` for closing `}`, insert before it. |
-| **Precondition** | Class `class_name` must exist in the file (verified against graph) |
-| **Runtime error** | `ValueError("Class '{name}' not found in {file}")` |
-| **Edge cases** | Trailing newline auto-appended. A blank line is prepended (`"\n" + method_code`) for readability. The LLM must provide correctly indented code. |
-| **Tree-sitter nodes** | Searches: `class_definition`, `class_declaration`, `class_specifier`, `struct_specifier`, `interface_declaration`, `trait_item` |
-
-```json
-{"op": "add_method", "params": {
-  "file": "src/query.py", "class_name": "QuerySet",
-  "method_code": "    def _clear_cache(self):\n        self._cache = {}"
-}}
-```
-
-##### `add_import` -- Import Statement Insertion
-
-Inserts an import statement after the last existing import in the file. Language-agnostic heuristic.
-
-| | |
-|---|---|
-| **Parameters** | `file` (path), `import_statement` (full import line) |
-| **Mechanism** | Scan all lines for `import ` or `from ` prefixes, find last occurrence, insert after it. If no imports exist, insert at top after comments/docstrings. |
-| **Precondition** | None (always succeeds) |
-| **Edge cases** | Trailing newline auto-appended. Heuristic only matches Python-style `import`/`from` -- for other languages (e.g., `#include`, `use`), the LLM should use `insert_code` with an explicit line number instead. |
-
-```json
-{"op": "add_import", "params": {
-  "file": "src/query.py",
-  "import_statement": "from collections import OrderedDict"
-}}
-```
-
-##### `modify_function_signature` -- Signature Replacement
-
-Changes a function's def/declaration line. Uses string replacement, not tree-sitter.
-
-| | |
-|---|---|
-| **Parameters** | `file` (path), `func_name` (for graph verification), `old_signature` (exact string), `new_signature` (replacement string) |
-| **Mechanism** | `content.replace(old_signature, new_signature, 1)` |
-| **Precondition** | Function `func_name` must exist in the graph. `old_signature` must exist in file content. |
-| **Runtime error** | `ValueError("Old signature not found: {sig}")` |
-| **Edge cases** | Multi-line signatures: `old_signature` must match exactly including indentation and newlines. |
-
-```json
-{"op": "modify_function_signature", "params": {
-  "file": "src/query.py", "func_name": "defer",
-  "old_signature": "def defer(self, *fields)",
-  "new_signature": "def defer(self, *fields, clear_cache=True)"
-}}
-```
-
-#### Tier 2: Structural Operators
-
-##### `rename_symbol` -- Word-Boundary Rename
-
-Renames all occurrences of a symbol within a single file using regex word boundaries.
-
-| | |
-|---|---|
-| **Parameters** | `file` (path, must not be `"all"`), `old_name` (identifier), `new_name` (identifier) |
-| **Mechanism** | `re.sub(r'\b' + re.escape(old_name) + r'\b', new_name, content)` |
-| **Precondition** | `file` must not be `"all"` (cross-file rename is unsupported) |
-| **Runtime error** | `ValueError("rename_symbol with file='all' requires explicit file listing")` |
-| **Edge cases** | Word boundaries prevent partial matches (`_deferred` won't match `deferred`). `re.escape` handles special characters in the name. Replaces *all* occurrences in the file, not just the first. Doesn't distinguish definitions from references -- renames everything matching the boundary pattern. |
-
-```json
-{"op": "rename_symbol", "params": {
-  "file": "src/query.py", "old_name": "_deferred", "new_name": "_deferred_fields"
-}}
-```
-
-##### `wrap_block` -- Indentation-Aware Block Wrapping
-
-Wraps a range of lines in a block structure (try/except, if/else, with statement, etc.). Auto-indents wrapped lines by 4 spaces.
-
-| | |
-|---|---|
-| **Parameters** | `file` (path), `start_line` (1-indexed), `end_line` (1-indexed, inclusive), `before_code` (opening line, e.g. `"    try:"`), `after_code` (closing lines, e.g. `"    except ValueError:\n        pass"`) |
-| **Mechanism** | Extract `lines[start-1:end]`, indent each non-empty line by 4 spaces, sandwich between `before_code` and `after_code`, replace original range. |
-| **Precondition** | `start_line <= end_line` |
-| **Edge cases** | Empty lines (whitespace-only) are *not* indented, preserving blank line aesthetics. Trailing newlines auto-appended to `before_code` and `after_code`. The indentation level of `before_code`/`after_code` must be specified by the LLM. |
-
-```json
-{"op": "wrap_block", "params": {
-  "file": "src/query.py", "start_line": 50, "end_line": 55,
-  "before_code": "    try:",
-  "after_code": "    except ValueError:\n        pass"
-}}
-```
-
-##### `add_class_attribute` -- Class-Level Attribute Insertion
-
-Inserts a class-level attribute at the top of a class body. In Python, skips past any docstring.
-
-| | |
-|---|---|
-| **Parameters** | `file` (path), `class_name` (exact name), `attribute_code` (full line with indentation) |
-| **Mechanism** | **Python**: uses `_find_python_docstring_end_ts()` to locate the docstring end, inserts after it. If no docstring, inserts at `body_start`. **Brace-based**: inserts right after the opening `{` line. |
-| **Precondition** | Class `class_name` must exist in the file (verified against graph) |
-| **Runtime error** | `ValueError("Class '{name}' not found in {file}")` |
-| **Tree-sitter nodes** | Python docstring detection: walks `class_definition` -> `body` -> first child, checks for `expression_statement` containing `string` node. |
-
-```json
-{"op": "add_class_attribute", "params": {
-  "file": "src/query.py", "class_name": "QuerySet",
-  "attribute_code": "    _deferred_cache = None"
-}}
-```
-
-##### `replace_function_body` -- Full Body Replacement
-
-Replaces the entire body of a function. Uses `_find_function_node_ts()` to locate the function boundaries via tree-sitter.
-
-| | |
-|---|---|
-| **Parameters** | `file` (path), `func_name` (exact name), `new_body` (replacement source with indentation) |
-| **Mechanism** | **Python**: `lines[body_start-1 : body_end] = [new_body]` -- replaces the tree-sitter `block` node content. **Brace-based**: replaces content between `{` and `}`. For single-line bodies (`{ return x; }`), reconstructs as multi-line. |
-| **Precondition** | Function `func_name` must exist in the file (verified against graph) |
-| **Runtime error** | `ValueError("Function '{name}' not found in {file}")` |
-| **Tree-sitter nodes** | Searches: `function_declaration`, `function_definition`, `method_declaration`, `method_definition`, `function_item`, `constructor_declaration`. For C/C++, also traverses `declarator` -> nested `declarator` to find the name. |
-
-```json
-{"op": "replace_function_body", "params": {
-  "file": "src/query.py", "func_name": "_clear_cache",
-  "new_body": "        self._cache = {}\n        self._result_cache = None"
-}}
-```
-
-### Operator Classification
-
-```mermaid
-flowchart LR
-    subgraph String ["String-Based Operators"]
-        RC[replace_code]
-        MFS[modify_function_signature]
-        RS[rename_symbol]
-    end
-
-    subgraph Line ["Line-Based Operators"]
-        IC[insert_code]
-        DL[delete_lines]
-        WB[wrap_block]
-        AI[add_import]
-    end
-
-    subgraph TS ["Tree-Sitter-Guided Operators"]
-        AM[add_method]
-        ACA[add_class_attribute]
-        RFB[replace_function_body]
-    end
-
-    String -.- Note1["Match exact text in file content<br/>No AST awareness needed"]
-    Line -.- Note2["Operate on line numbers<br/>Graph view provides line refs"]
-    TS -.- Note3["Use _find_class_node_ts /<br/>_find_function_node_ts<br/>for structural boundaries"]
-```
-
-### Multi-Language Operator Dispatch
-
-Three operators use tree-sitter for structural navigation: `add_method`, `add_class_attribute`, `replace_function_body`. These dispatch based on language:
+1. **Primitives** (6 mutators + 2 read-only) — Low-level AST-node operations that use **locators** to find targets structurally. Each primitive has pre/postcondition checking and automatic rollback on failure.
+2. **Composed operators** (3 built-in + LLM-defined) — Higher-level operations expressed as sequences of primitives via a JSON DSL. Built-in: `add_method`, `add_import`, `add_class_attribute`.
+3. **Legacy operators** (10 original) — String/line-based operators kept for backward compatibility.
 
 ```mermaid
 flowchart TD
-    Op["Structural operator<br/>(add_method / add_class_attribute /<br/>replace_function_body)"]
-    Op --> FindNode["_find_class_node_ts() or<br/>_find_function_node_ts()"]
-    FindNode --> Lang{Language?}
-
-    Lang -->|Python| PY["Indentation-based"]
-    Lang -->|"JS / TS / Java / Go<br/>Rust / C / C++ / ..."| Brace["Brace-based"]
-
-    subgraph PY_detail ["Python dispatch"]
-        PY1["add_method: insert after<br/>last line of class"]
-        PY2["add_class_attribute: insert after<br/>docstring or class def"]
-        PY3["replace_function_body: replace<br/>body block node"]
+    subgraph Primitives ["AST-Node Primitives"]
+        direction LR
+        RN[replace_node]
+        IBN[insert_before_node]
+        IAN[insert_after_node]
+        DN[delete_node]
+        WN[wrap_node]
+        RAM[replace_all_matching]
     end
 
-    subgraph Brace_detail ["Brace-based dispatch"]
-        BR1["add_method: insert before<br/>closing }"]
-        BR2["add_class_attribute: insert after<br/>opening {"]
-        BR3["replace_function_body: replace<br/>content between { and }"]
+    subgraph ReadOnly ["Read-Only Primitives"]
+        direction LR
+        LOC[locate]
+        LR2[locate_region]
     end
 
-    PY --> PY_detail
-    Brace --> Brace_detail
+    subgraph Composed ["Composed Operators"]
+        direction LR
+        AM2[add_method]
+        AI2[add_import]
+        ACA2[add_class_attribute]
+        CUSTOM["LLM-defined<br/>(via define_operators)"]
+    end
+
+    subgraph Legacy ["Legacy Operators (backward compat)"]
+        direction LR
+        RC2[replace_code]
+        IC2[insert_code]
+        DL2[delete_lines]
+        MORE["...7 more"]
+    end
+
+    Composed -->|"expand to"| Primitives
+    Primitives -->|"use"| Locators["Locator System<br/>(AST node addressing)"]
+
+    style Primitives fill:#1a3a2a,stroke:#2d6a4f
+    style Composed fill:#1a2a3a,stroke:#2d4f6a
+    style Legacy fill:#3a2a1a,stroke:#6a4f2d
 ```
 
-Node finders search for language-specific AST node types:
-- `_find_class_node_ts`: `class_definition`, `class_declaration`, `class_specifier`, `struct_specifier`, `interface_declaration`, `trait_item`
-- `_find_function_node_ts`: `function_declaration`, `function_definition`, `method_declaration`, `method_definition`, `function_item`, `constructor_declaration`
+### The Locator System
 
-### Plan Format
+Every primitive identifies its target via a **Locator** — a JSON object resolved against the live AST. Locators re-query the fresh AST on every step, eliminating line-drift issues entirely.
 
-The LLM outputs a JSON array of operator steps:
+#### Structured Locator (common cases)
 
 ```json
+{"kind": "function", "name": "defer", "file": "query.py",
+ "parent": {"kind": "class", "name": "QuerySet"}}
+```
+
+#### S-Expression Locator (advanced)
+
+```json
+{"type": "sexp", "file": "query.py",
+ "query": "(identifier) @id (#eq? @id \"defer\")", "capture": "id"}
+```
+
+#### Locator Fields
+
+| Field | Description |
+|-------|-------------|
+| `kind` | Normalized AST kind: `function`, `class`, `method`, `import`, `statement`, `interface`, `enum`. Auto-mapped to language-specific tree-sitter node types via `NORMALIZED_KINDS` |
+| `name` | Symbol name (for named nodes) |
+| `file` | File path |
+| `parent` | Nested locator constraining search to children of parent |
+| `field` | Named tree-sitter field of matched node (`body`, `parameters`, `condition`) |
+| `nth_child` | Select Nth child of matched node (-1 for last) |
+| `index` | Disambiguate when multiple matches (0-based). Error if >1 match and no index |
+
+#### Kind Normalization (`NORMALIZED_KINDS`)
+
+Reuses existing `LANGUAGE_QUERIES` and `LINE_KIND_MAP`. Maps normalized kind names to per-language tree-sitter node types:
+
+| Normalized | Python | JavaScript | Java | Go | Rust | C/C++ |
+|-----------|--------|-----------|------|----|----|------|
+| `function` | `function_definition` | `function_declaration`, `arrow_function` | `method_declaration`, `constructor_declaration` | `function_declaration`, `method_declaration` | `function_item` | `function_definition` |
+| `class` | `class_definition` | `class_declaration` | `class_declaration` | — | `struct_item` | `class_specifier`, `struct_specifier` |
+| `method` | `function_definition` | `method_definition` | `method_declaration` | `method_declaration` | `function_item` | `function_definition` |
+| `import` | `import_statement`, `import_from_statement` | `import_statement` | `import_declaration` | `import_declaration` | `use_declaration` | `preproc_include` |
+| `statement` | `expression_statement`, `return_statement`, ... | `expression_statement`, `return_statement`, ... | (same pattern) | (same pattern) | (same pattern) | (same pattern) |
+
+#### Locator Resolution (`resolve_locator`)
+
+```python
+def resolve_locator(locator, file_path, language, tree=None, source=None):
+    """Resolve a locator against the live AST, returning matching nodes."""
+    if locator.get("type") == "sexp":
+        # S-expression query: run tree-sitter query, return captured nodes
+        query = ts_lang.query(locator["query"])
+        captures = query.captures(tree.root_node)
+        return _get_captures_list(captures, locator.get("capture", "target"))
+
+    # Structured locator: walk AST matching kind + name
+    kind = locator.get("kind")
+    name = locator.get("name")
+    target_types = _get_normalized_node_types(kind, language)
+    matches = []
+    _collect_matching_nodes(tree.root_node, target_types, name, kind, language, matches)
+
+    # Apply parent constraint (filter to nodes inside parent)
+    if "parent" in locator:
+        parent_nodes = resolve_locator(locator["parent"], file_path, language, tree, source)
+        matches = [m for m in matches if any(_is_descendant(m, p) for p in parent_nodes)]
+
+    # Apply field selection (navigate to named child field)
+    if "field" in locator:
+        matches = [m.child_by_field_name(locator["field"]) for m in matches if m.child_by_field_name(locator["field"])]
+
+    # Apply nth_child selection
+    if "nth_child" in locator:
+        matches = [m.children[locator["nth_child"]] for m in matches if m.children]
+
+    # Apply index disambiguation
+    if "index" in locator and len(matches) > 1:
+        matches = [matches[locator["index"]]]
+
+    return matches
+```
+
+### Mutator Primitives
+
+6 mutators + 1 batch operation. Each follows the **execution protocol**: pre-check → save original → apply byte-level edit → post-check → rollback on failure.
+
+#### Execution Protocol
+
+```python
+def _execute_primitive(name, params):
+    locator = params["locator"]
+    filepath = locator["file"]
+    original = open(filepath, "rb").read()       # save for rollback
+    tree = parser.parse(original)                # fresh AST
+    nodes = resolve_locator(locator, filepath, lang, tree, original)
+    _check_preconditions(name, filepath, nodes, params)  # fail fast
+    new_content = _apply_primitive_edit(name, filepath, nodes, params, original)
+    open(filepath, "wb").write(new_content)
+    if not _check_postconditions(name, filepath, locator, params):
+        open(filepath, "wb").write(original)     # ROLLBACK
+        return {"success": False, "rolled_back": True, "error": "Postcondition failed"}
+    return {"success": True}
+```
+
+#### `replace_node`
+
+Replaces the text of an AST node identified by a locator.
+
+| | |
+|---|---|
+| **Parameters** | `locator` (target node), `replacement` (new source text) |
+| **Precondition** | Locator resolves to exactly 1 node |
+| **Postcondition** | File parses without errors |
+
+```json
+{"op": "replace_node", "params": {
+  "locator": {"kind": "function", "name": "defer", "file": "src/query.py",
+              "parent": {"kind": "class", "name": "QuerySet"}},
+  "replacement": "def defer(self, *fields, clear_cache=True):\n        ..."
+}}
+```
+
+#### `insert_before_node` / `insert_after_node`
+
+Insert code before or after an AST node.
+
+| | |
+|---|---|
+| **Parameters** | `locator` (anchor node), `code` (text to insert), `separator` (optional, default `"\n"`) |
+| **Precondition** | Locator resolves to ≥1 node |
+| **Postcondition** | File parses without errors |
+
+```json
+{"op": "insert_after_node", "params": {
+  "locator": {"kind": "import", "file": "src/query.py", "index": -1},
+  "code": "from collections import OrderedDict"
+}}
+```
+
+#### `delete_node`
+
+Removes an AST node entirely.
+
+| | |
+|---|---|
+| **Parameters** | `locator` (target node) |
+| **Precondition** | Locator resolves to ≥1 node |
+| **Postcondition** | File parses without errors, node no longer exists |
+
+```json
+{"op": "delete_node", "params": {
+  "locator": {"kind": "function", "name": "deprecated_helper", "file": "src/utils.py"}
+}}
+```
+
+#### `wrap_node`
+
+Wraps an AST node with before/after code.
+
+| | |
+|---|---|
+| **Parameters** | `locator` (target node), `before` (prefix code), `after` (suffix code), `indent_body` (optional, extra indentation for wrapped content) |
+| **Precondition** | Locator resolves to ≥1 node |
+| **Postcondition** | File parses without errors |
+
+```json
+{"op": "wrap_node", "params": {
+  "locator": {"kind": "statement", "file": "src/query.py", "index": 0},
+  "before": "try:\n    ", "after": "\nexcept ValueError:\n    pass"
+}}
+```
+
+#### `replace_all_matching`
+
+Replaces all AST nodes matching a locator. Processes replacements bottom-up (last byte offset first) to avoid invalidation.
+
+| | |
+|---|---|
+| **Parameters** | `locator` (target nodes), `replacement` (new text), `filter` (optional: `"not_in_string_or_comment"`) |
+| **Precondition** | Locator resolves to ≥1 node |
+| **Postcondition** | File parses without errors, 0 matches remain |
+
+```json
+{"op": "replace_all_matching", "params": {
+  "locator": {"type": "sexp", "file": "src/query.py",
+              "query": "(identifier) @id (#eq? @id \"old_name\")", "capture": "id"},
+  "replacement": "new_name",
+  "filter": "not_in_string_or_comment"
+}}
+```
+
+### Read-Only Primitives
+
+| Primitive | Input | Output |
+|-----------|-------|--------|
+| **`locate`** | `{locator}` | `{found, count, nodes: [{start_line, end_line, kind, text_preview}]}` |
+| **`locate_region`** | `{locator}` | `{start_byte, end_byte, start_line, end_line, text}` |
+
+These are used within composed operators for conditional logic and variable binding.
+
+### Composed Operators
+
+Built-in composed operators are expressed as sequences of primitive steps. They map the legacy high-level operators to AST-node primitives.
+
+#### Built-in Composed Operators
+
+| Operator | Expands To |
+|----------|-----------|
+| `add_method` | `locate` class body → `insert_after_node` at last child |
+| `add_import` | `locate` last import → `insert_after_node` |
+| `add_class_attribute` | `locate` class body → `insert_before_node` at first non-docstring child |
+
+Example expansion of `add_method`:
+```json
 [
-  {
-    "op": "replace_code",
-    "params": {
-      "file": "src/marshmallow/schema.py",
-      "pattern": "for attr_name in self.__processors__",
-      "replacement": "if data is None:\n            return\n        for attr_name in self.__processors__"
-    }
-  },
-  {
-    "op": "add_import",
-    "params": {
-      "file": "src/marshmallow/schema.py",
-      "import_statement": "from marshmallow.exceptions import ValidationError"
-    }
-  }
+  {"primitive": "locate", "params": {
+    "locator": {"kind": "class", "name": "$class_name", "file": "$file", "field": "body"}
+  }, "bind": "body"},
+  {"primitive": "insert_after_node", "params": {
+    "locator": {"kind": "class", "name": "$class_name", "file": "$file", "field": "body", "nth_child": -1},
+    "code": "\n$method_code"
+  }}
 ]
+```
+
+#### LLM-Defined Custom Operators (`define_operators`)
+
+The LLM can define custom operators at plan time using the JSON DSL:
+
+```json
+{
+  "define_operators": [
+    {
+      "define": "add_cached_property",
+      "params_schema": {"file": "string", "class_name": "string", "prop_name": "string", "body": "string"},
+      "steps": [
+        {"primitive": "insert_after_node", "params": {
+          "locator": {"kind": "class", "name": "$class_name", "file": "$file", "field": "body", "nth_child": -1},
+          "code": "\n    @cached_property\n    def $prop_name(self):\n$body"
+        }}
+      ]
+    }
+  ],
+  "plan": [
+    {"op": "add_import", "params": {"file": "query.py", "import_statement": "from functools import cached_property"}},
+    {"op": "add_cached_property", "params": {"file": "query.py", "class_name": "QuerySet", "prop_name": "_key", "body": "        return hash(self.query)"}}
+  ]
+}
+```
+
+**Variable binding**: `$param` references operator params; `{"primitive": ..., "bind": "var"}` captures output; `$var.field` accesses nested fields.
+
+**Conditional logic** (limited, intentional): `{"if": "$var.count > 0", "then": {...}, "else": {...}}`
+
+Custom operators are **ephemeral** — they exist only for the current plan.
+
+### DSL Interpreter
+
+The DSL interpreter (`execute_dsl_steps`, `resolve_var`) handles:
+
+1. **Variable resolution**: `$param` references in strings, dicts, and lists are resolved from the current variable context
+2. **Step execution**: Each step in a composed operator is executed as a primitive
+3. **Binding**: `"bind": "var_name"` captures the output of a step for use in subsequent steps
+4. **Conditionals**: `{"if": "expr", "then": step, "else": step}` for simple branching
+
+### Plan Formats
+
+Two formats are supported:
+
+#### Array format (simple)
+```json
+[
+  {"op": "replace_node", "params": {"locator": {...}, "replacement": "..."}},
+  {"op": "add_import", "params": {"file": "src/query.py", "import_statement": "..."}}
+]
+```
+
+#### Object format (with custom operators)
+```json
+{
+  "define_operators": [...],
+  "plan": [
+    {"op": "replace_node", "params": {...}},
+    {"op": "custom_op", "params": {...}}
+  ]
+}
 ```
 
 ### Plan Validation
 
-Extracted JSON arrays are validated with `_is_valid_plan()` to prevent non-plan data (like file lists from `READY_TO_PLAN` markers) from being treated as edit plans:
+Extracted JSON is validated with `_is_valid_plan()` which accepts both formats:
 
 ```python
 @staticmethod
-def _is_valid_plan(plan: list) -> bool:
+def _is_valid_plan(plan) -> bool:
+    if isinstance(plan, dict) and "plan" in plan:
+        return _is_valid_plan(plan["plan"])  # validate inner plan list
     if not isinstance(plan, list) or len(plan) == 0:
         return False
     return isinstance(plan[0], dict) and "op" in plan[0]
 ```
-
-This rejects `["src/foo.py", "src/bar.py"]` while accepting `[{"op": "replace_code", "params": {...}}]`.
 
 ### How the LLM Writes the Plan
 
@@ -571,7 +628,7 @@ The LLM model always requires bash tool calls (enforced by LitellmModel). So the
 
 ```bash
 cat > /tmp/edit_plan.json << 'PLAN_EOF'
-[{"op": "replace_code", "params": {"file": "...", ...}}]
+[{"op": "replace_node", "params": {"locator": {...}, ...}}]
 PLAN_EOF
 ```
 
@@ -580,15 +637,51 @@ The agent then reads `/tmp/edit_plan.json` from the container. This naturally sa
 2. Nudges the LLM to write the file (up to 5 attempts)
 3. Falls back to standard step loop if plan generation fails entirely
 
+### Mapping Legacy Operators to Primitives
+
+| Legacy Operator | Primitive Equivalent |
+|-------------|-----------------|
+| `replace_code(file, pattern, replacement)` | `replace_node` with locator targeting the AST node containing the pattern |
+| `insert_code(file, anchor_line, position, code)` | `insert_before_node` / `insert_after_node` with structural locator |
+| `delete_lines(file, start, end)` | `delete_node` targeting the statement/block node |
+| `add_method(file, class, code)` | Composed: `locate` class body → `insert_after_node` |
+| `add_import(file, stmt)` | Composed: `locate` last import → `insert_after_node` |
+| `modify_function_signature(file, func, old, new)` | `replace_node` targeting `{kind: "function", name, field: "parameters"}` |
+| `rename_symbol(file, old, new)` | `replace_all_matching` with S-exp locator + `filter: "not_in_string_or_comment"` |
+| `wrap_block(file, start, end, before, after)` | `wrap_node` targeting the statement node |
+| `add_class_attribute(file, class, code)` | Composed: `locate` class body → `insert_before_node` |
+| `replace_function_body(file, func, body)` | `replace_node` targeting `{kind: "function", name, field: "body"}` |
+
+### Legacy Operators (Backward Compatibility)
+
+The original 10 string/line-based operators are still available. They use text matching and line numbers rather than AST locators. When a step uses a legacy operator name with legacy parameter format (no `locator`), execution routes through the original `_exec_*` functions.
+
+<details>
+<summary>Legacy operator reference (click to expand)</summary>
+
+#### `replace_code` — String find-and-replace (`content.replace(pattern, replacement, 1)`)
+#### `insert_code` — Line-anchored insertion at `anchor_line`
+#### `delete_lines` — Range deletion by line numbers
+#### `add_method` — Tree-sitter-guided class insertion (legacy implementation)
+#### `add_import` — Import statement insertion after last import
+#### `modify_function_signature` — Signature string replacement
+#### `rename_symbol` — Word-boundary regex rename
+#### `wrap_block` — Indentation-aware block wrapping by line range
+#### `add_class_attribute` — Class-level attribute insertion (legacy implementation)
+#### `replace_function_body` — Full body replacement via tree-sitter
+
+</details>
+
 ## Phase 3: Plan Verification -- The 7-Layer System
 
 ### Honest Assessment
 
-The plan verification system is **not** formal verification in the academic sense. It does not provide mathematical proofs of correctness, and it cannot guarantee that a plan will produce a semantically valid transformation. However, it now covers 7 layers of pre-execution checking that catch the most common failure modes:
+The plan verification system is **not** formal verification in the academic sense. It does not provide mathematical proofs of correctness, and it cannot guarantee that a plan will produce a semantically valid transformation. However, it covers 7 layers of pre-execution checking plus **locator-based precondition checking** for AST-node primitives:
 
 ```mermaid
 flowchart LR
     subgraph Actually ["What We Actually Have"]
+        A0b["Locator preconditions<br/><i>AST node resolution check</i>"]
         A1["Schema validation<br/><i>valid op, required params</i>"]
         A2["Referential integrity<br/><i>symbols exist in graph</i>"]
         A3["Bounds checking<br/><i>line numbers in range</i>"]
@@ -611,66 +704,55 @@ flowchart LR
 
 | What we call it | What it really is | What formal verification would require |
 |---|---|---|
+| "Locator precondition" | **AST node resolution** — verify the locator finds the expected target node in the live AST | Proving the locator semantics match intent |
 | "Precondition verification" | **Schema validation** + **referential integrity** + **content pre-checks** + **line drift analysis** + **AST context** + **scope classification** + **cross-file impact** | Proving the transformation preserves program semantics |
-| "Postcondition validation" | **Syntax linting** (no parse errors after edit) + **preflight simulation** (check before writing) | Proving the output satisfies a specification |
-| `replace_code` pattern match | **Pre-checked**: exact match verified, fuzzy fallback with similarity score, AST context check, preflight syntax simulation | Pattern would need to reference AST nodes, not raw text |
+| "Postcondition validation" | **Syntax linting** (no parse errors after edit) + per-primitive rollback | Proving the output satisfies a specification |
 | `_syntax_check()` | Parse tree has no ERROR nodes (both post-execution and pre-flight) | Would need type checking, data-flow analysis |
 
-### The Semantic Gap (Narrowed)
+### The Semantic Gap (Narrowed Further)
 
-The most-used operator, `replace_code`, depends entirely on an LLM-provided `pattern` string. This is a **content-dependent, semantic match** -- not a structural one. However, with the 7-layer system, these content-dependent operators now have **pre-execution verification** that catches most failures:
+With the primitive system, the semantic gap is further narrowed. AST-node primitives use **structural locators** instead of text patterns, which eliminates the most fragile matching. The locator system re-queries the live AST on every step, so there is no line drift.
 
 ```mermaid
 flowchart TD
-    subgraph Structural ["Structurally Verifiable (graph + bounds)"]
-        S1["add_method: class 'QuerySet'<br/>exists in graph? YES"]
-        S2["replace_function_body: func<br/>'_clear_cache' exists? YES"]
-        S3["insert_code: line 847<br/>in range 1-920? YES"]
+    subgraph Structural ["Structurally Verifiable (AST locators)"]
+        S1["replace_node: locator finds target<br/>function/class node? YES"]
+        S2["delete_node: locator resolves<br/>to existing node? YES"]
+        S3["insert_after_node: anchor<br/>node exists in AST? YES"]
     end
 
-    subgraph Content ["Content-Verified (Layers 1, 3, 5)"]
-        R1["replace_code: pattern exists<br/>in file? Checked pre-execution.<br/>Fuzzy match if not exact."]
-        R2["modify_function_signature:<br/>old_signature exists? Checked."]
+    subgraph Composed ["Composed Operator Verification"]
+        C1["add_method: class exists<br/>in graph? Locator resolves?"]
+        C2["add_import: last import<br/>node found?"]
+    end
+
+    subgraph LegacyContent ["Legacy Content-Verified (Layers 1, 3, 5)"]
+        R1["replace_code: pattern exists<br/>in file? Fuzzy match."]
         R3["Replacement produces valid<br/>syntax? Preflight simulated."]
     end
 
     subgraph Remaining ["Remaining Semantic Gap"]
         G1["Does the fix actually<br/>solve the bug?"]
-        G2["Are all callers updated<br/>for signature changes?"]
     end
 
-    S1 -.- Note1["Graph + bounds checks"]
-    R1 -.- Note2["Content pre-checks<br/>+ fuzzy match + AST context<br/>+ preflight syntax"]
-    G1 -.- Note3["Only tests can verify<br/>behavioral correctness"]
+    S1 -.- Note1["Locator-based<br/>precondition checking"]
+    C1 -.- Note2["Graph + locator checks"]
+    R1 -.- Note3["Content pre-checks<br/>(legacy operators only)"]
+    G1 -.- Note4["Only tests can verify<br/>behavioral correctness"]
 
     style Structural fill:#1a3a2a,stroke:#2d6a4f
-    style Content fill:#2a3a1a,stroke:#4f6a2d
+    style Composed fill:#1a2a3a,stroke:#2d4f6a
+    style LegacyContent fill:#2a3a1a,stroke:#4f6a2d
     style Remaining fill:#3a2a1a,stroke:#6a4f2d
 ```
 
-**All 10 operators** now have pre-execution verification. The 4 previously "runtime-only" operators are now content-verified:
+**Primitive ops** have locator-based precondition checking (Layer 0b) that verifies the target node exists in the AST before plan execution begins.
 
-| Operator | Previously Unverifiable | Now Verified By |
-|----------|----------------------|------------------|
-| `replace_code` | `pattern` | **Layer 1** (exact + fuzzy match), **Layer 3** (AST context), **Layer 5** (preflight syntax) |
-| `modify_function_signature` | `old_signature` | **Layer 1** (exact match check) |
-| `rename_symbol` | `old_name` | **Layer 1** (word-boundary check), **Layer 4** (scope classification), **Layer 6** (cross-file impact) |
-| `add_import` | `import_statement` | **Layer 1** (duplication detection -- warning) |
-
-**6 of 10 operators** remain structurally verifiable via the graph (unchanged):
-
-| Operator | Verifiable precondition | How |
-|----------|------------------------|-----|
-| `add_method` | `class_name` exists + duplicate check | Graph symbol lookup + **Layer 1** method name check |
-| `add_class_attribute` | `class_name` exists | Graph symbol lookup: `kind == "class"` |
-| `replace_function_body` | `func_name` exists | Graph symbol lookup: `kind == "function"` |
-| `modify_function_signature` | `func_name` exists + `old_signature` exists | Graph + **Layer 1** content check |
-| `insert_code` | `anchor_line` in range | File line count + **Layer 2** drift detection |
-| `delete_lines` | `start_line <= end_line`, in bounds + impact check | File line count + **Layer 2** drift + **Layer 6** cross-file |
+**Legacy operators** retain the original 7-layer verification (Layers 0-6).
 
 ### What the Verification Actually Checks
 
-The `verify_plan()` function runs inside the Docker container, receives the plan JSON and graph JSON, and checks every step against **7 layers**. Errors block execution; warnings are displayed but don't block. All new layers degrade gracefully when tree-sitter is unavailable.
+The `verify_plan()` function runs inside the Docker container, receives the plan JSON and graph JSON, and checks every step. It handles both plan formats (array and object with `define_operators`). Errors block execution; warnings are displayed but don't block. All layers degrade gracefully when tree-sitter is unavailable.
 
 #### Layer 0: Structural Checks (Schema + File + Graph + Bounds)
 
@@ -678,13 +760,34 @@ Every step must have a valid operator name, all required parameters, target an e
 
 | Check | Rule | Error format |
 |-------|------|-------------|
-| Operator name | `op in VALID_OPS` (set of 10) | `"Step {i}: Unknown operator '{op}'"` |
-| Required params | All keys in `REQUIRED_PARAMS[op]` present | `"Step {i}: Missing parameter '{p}' for {op}"` |
+| Operator name | `op in ALL_VALID_OPS` (primitives + composed + legacy) | `"Step {i}: Unknown operator '{op}'"` |
+| Required params | All keys in `REQUIRED_PARAMS[op]` present (legacy ops) | `"Step {i}: Missing parameter '{p}' for {op}"` |
 | File exists | `os.path.isfile(file_path)` | `"Step {i}: File '{path}' does not exist"` |
 | Symbol in graph | Class/function exists with correct kind and file | `"Step {i} ({op}): Class/Function '{name}' not found"` |
 | Line range valid | `anchor_line` in range, `start_line <= end_line` | `"anchor_line {n} out of range"` / `"start_line > end_line"` |
 
 **What this catches:** Hallucinated operators, missing parameters, nonexistent files/symbols, out-of-bounds lines.
+
+#### Layer 0b: Locator-Based Precondition Checks (Primitive Ops)
+
+For steps using AST-node primitives, verifies that the locator resolves to at least one node in the current AST. This catches hallucinated node names or incorrect structural paths before execution.
+
+| Check | Rule | Error format |
+|-------|------|-------------|
+| Locator resolves | `resolve_locator()` returns ≥1 node | `"Step {i} ({op}): Locator did not match any AST node"` |
+| File in locator | Locator has `file` field pointing to existing file | `"Step {i} ({op}): Locator file '{path}' does not exist"` |
+
+```python
+if op in PRIMITIVE_OPS and "locator" in params:
+    locator = params["locator"]
+    file_path = locator.get("file")
+    if file_path and os.path.isfile(file_path):
+        nodes = resolve_locator(locator, file_path, detect_language(file_path))
+        if not nodes:
+            errors.append(f"Step {i} ({op}): Locator did not match any AST node")
+```
+
+**What this catches:** The AST-node equivalent of "pattern not found" — locators that specify nonexistent functions, classes, or structural paths. Caught at verification time, not execution time.
 
 #### Layer 1: Content Existence Pre-Check
 
@@ -1158,14 +1261,15 @@ Each operator has specific failure modes that are **silent** (no error raised, b
 
 ### Implementation Status
 
-All 7 layers are implemented. The helper functions and expanded `verify_plan()` add ~250 lines to `graph_plan_scripts.py`.
+All 7 layers + Layer 0b (locator preconditions) are implemented. The primitive system adds ~730 lines to `graph_plan_scripts.py` (locators, primitives, verifiers, DSL interpreter, composed operators).
 
 ```mermaid
 flowchart LR
     subgraph Done ["All Layers Implemented"]
         direction TB
-        P1["Layer 1: Pattern Pre-Check<br/><i>_fuzzy_find + _extract_method_name<br/>~35 lines</i>"]
-        P2["Layer 2: Line Drift Analysis<br/><i>_check_line_drift<br/>~80 lines</i>"]
+        P0b["Layer 0b: Locator Preconditions<br/><i>resolve_locator<br/>~150 lines</i>"]
+        P1["Layer 1: Pattern Pre-Check<br/><i>_fuzzy_find + _extract_method_name<br/>~35 lines (legacy)</i>"]
+        P2["Layer 2: Line Drift Analysis<br/><i>_check_line_drift<br/>~80 lines (legacy)</i>"]
         P3["Layer 3: AST Context Check<br/><i>_check_pattern_ast_context<br/>~50 lines</i>"]
         P4["Layer 4: Scope Analysis<br/><i>_classify_symbol_occurrences<br/>~60 lines</i>"]
         P5["Layer 5: Preflight Syntax<br/><i>_syntax_check_content<br/>~15 lines</i>"]
@@ -1175,77 +1279,98 @@ flowchart LR
     style Done fill:#1a3a2a,stroke:#2d6a4f
 ```
 
-| Layer | Helper Function(s) | Lines | Dependencies |
+| Component | Functions | Lines | Dependencies |
 |---|---|---|---|
-| Layer 1 | `_fuzzy_find()`, `_extract_method_name()` | ~35 | `difflib` (stdlib) |
-| Layer 2 | `_check_line_drift()` | ~80 | None |
-| Layer 3 | `_check_pattern_ast_context()` | ~50 | tree-sitter (optional) |
-| Layer 4 | `_classify_symbol_occurrences()` | ~60 | tree-sitter (optional) |
-| Layer 5 | `_syntax_check_content()` | ~15 | tree-sitter (optional) |
-| Layer 6 | `_build_import_graph()` | ~30 | None |
+| Locator system | `resolve_locator()`, `_collect_matching_nodes()`, `NORMALIZED_KINDS` | ~150 | tree-sitter |
+| Mutator primitives | `_execute_primitive()`, 6 `_prim_*` functions | ~250 | tree-sitter |
+| Verifier primitives | 6 `_verify_*` functions | ~80 | tree-sitter |
+| DSL interpreter | `resolve_var()`, `execute_dsl_steps()`, `expand_composed_operator()` | ~150 | None |
+| Composed operators | `BUILTIN_COMPOSED_OPS`, `_execute_composed_op()` | ~100 | DSL interpreter |
+| Layer 0b | Locator resolution in `verify_plan()` | ~20 | Locator system |
+| Layers 1-6 | (unchanged from original) | ~270 | Various |
 
-All tree-sitter-dependent layers (3, 4, 5) degrade gracefully when tree-sitter is unavailable -- they return success/None and emit no warnings. The `difflib` import is stdlib and available in all Docker containers.
+All tree-sitter-dependent components degrade gracefully when tree-sitter is unavailable. Legacy operators (Layers 1-2) continue to work as before.
 
 ### Key Architectural Insight: Static vs Adaptive Plans
 
 The most important lesson from CodePlan (Microsoft) is the distinction between **static plans** (generate complete plan, execute sequentially) and **adaptive plans** (plan grows/changes as edits reveal new impacts).
 
-Our current system uses a static plan with comprehensive pre-execution verification. Two pragmatic adaptations that could further improve reliability without requiring a full dynamic planning system:
+Our system uses a static plan with comprehensive pre-execution verification. The primitive system's **locator freshness** (re-querying the live AST on every step) provides a form of implicit adaptivity — each step operates on the current state, not stale assumptions.
 
-1. **Re-verify after each step**: After executing step N, re-run Layers 1-2 on steps N+1, N+2, ... to check that their assumptions still hold. If not, trigger plan revision for remaining steps only.
+Two pragmatic adaptations that could further improve reliability:
 
-2. **Classify edits by escape risk**: `replace_code` with a body-only change is **localized** (only affects replaced text). `rename_symbol` is **escaping** (affects all references). `modify_function_signature` is **escaping** (affects all callers). Layer 6's cross-file impact analysis now detects escaping edits, but doesn't yet reorder them.
+1. **Re-verify after each step**: After executing step N, re-run locator resolution for steps N+1, N+2, ... to check that their targets still exist. If not, trigger plan revision for remaining steps only. (The primitive system makes this natural since locators can be re-resolved cheaply.)
+
+2. **Classify edits by escape risk**: `replace_node` with a body-only locator is **localized** (only affects the targeted node). `replace_all_matching` is **escaping** (affects all matching references). `delete_node` is **escaping** (may affect importers). Layer 6's cross-file impact analysis detects escaping edits for both primitives and legacy operators.
 
 ### Remaining Gaps
 
-With all 7 layers implemented, the remaining gaps are:
+With the primitive system and 7-layer verification, the remaining gaps are:
 
 | Gap | Description | Difficulty |
 |-----|-------------|------------|
 | Adaptive re-verification | Re-run layers after each step execution | Medium |
-| Scope-aware rename execution | Actually skip string/comment occurrences during rename (currently just warns) | Medium |
-| Shadow detection | Detect when `rename_symbol` affects shadowed variables in nested scopes | High |
-| Full AST structural matching | Whitespace-insensitive tree matching for `replace_code` patterns | High |
+| Shadow detection | Detect when `replace_all_matching` affects shadowed variables in nested scopes | High |
+| S-expression locator validation | Pre-verify S-expression locators during plan verification (currently only structured locators are checked) | Medium |
 | Behavioral verification | Prove the fix actually solves the bug (fundamentally impossible without tests) | N/A |
+
+Note: Several gaps from the legacy system are addressed by the primitive system:
+- **Line drift** is eliminated by the locator system (no line numbers)
+- **Scope-aware rename** is addressed by `replace_all_matching` with `filter: "not_in_string_or_comment"`
+- **AST structural matching** is addressed by locators (structural node identification, not text patterns)
 
 ### Summary
 
-The verification system provides **7 layers of defensive checking**: schema validation, content existence with fuzzy matching, line drift detection, AST context analysis, scope classification, preflight syntax simulation, and cross-file impact analysis. Errors block execution; warnings inform the LLM and operator but allow the plan to proceed.
+The verification system provides **7 layers of defensive checking** plus **locator-based precondition checking** for AST-node primitives. The primitive system eliminates the most common failure modes by design:
 
-The system catches the most common failure modes before any files are modified:
-- **Pattern not found** (Layer 1) -- the single most common execution failure
-- **Line drift** (Layer 2) -- the second most dangerous failure class
-- **Syntax-breaking replacement** (Layer 5) -- caught before writing to disk
-- **Cross-file breakage** (Layer 6) -- warned before execution
+- **Line drift** — eliminated entirely (locators re-query the live AST, no line numbers)
+- **Pattern not found** — replaced by locator resolution (Layer 0b) for primitives; Layer 1 fuzzy matching for legacy ops
+- **Syntax-breaking replacement** — per-primitive postcondition check + rollback
+- **Cross-file breakage** — warned before execution (Layer 6)
 
-Behavioral correctness (whether the fix actually solves the bug) can only be verified by running tests externally after the agent finishes.
+The two-level rollback system (per-primitive + git stash) ensures the codebase is never left in an invalid state. Behavioral correctness (whether the fix actually solves the bug) can only be verified by running tests externally after the agent finishes.
 
 ## Phase 4: Execution with Postcondition Validation
 
 ### Execution Flow
 
-Each operator step executes sequentially:
+Steps execute sequentially. Primitive ops use per-primitive rollback; legacy ops use the original syntax-check flow:
 
 ```mermaid
 flowchart TD
     Start([Start execution]) --> Step["Next step in plan"]
-    Step --> Read[Read target file]
-    Read --> Apply[Apply transformation<br/><i>string replace / line insert / tree-sitter edit</i>]
+    Step --> IsPrimitive{Primitive op?}
+
+    IsPrimitive -->|Yes| PrimExec["_execute_primitive()"]
+    PrimExec --> PreCheck["Pre-check:<br/>resolve locator,<br/>verify node exists"]
+    PreCheck -->|Fail| PrimFail(["Step FAILED<br/><i>no file modified</i>"])
+    PreCheck -->|OK| SaveOrig["Save original file"]
+    SaveOrig --> ApplyEdit["Apply byte-level edit"]
+    ApplyEdit --> PostCheck{"Post-check:<br/>parses_ok?<br/>postconditions?"}
+    PostCheck -->|Fail| Rollback["ROLLBACK:<br/>restore original file"]
+    Rollback --> PrimFail
+    PostCheck -->|OK| More
+
+    IsPrimitive -->|No (legacy)| Read[Read target file]
+    Read --> Apply[Apply transformation]
     Apply --> Write[Write file back]
-    Write --> SyntaxCheck{"_syntax_check(filepath)<br/>POSTCONDITION"}
+    Write --> SyntaxCheck{"_syntax_check(filepath)"}
     SyntaxCheck -->|Valid| More{More steps?}
+    SyntaxCheck -->|"ERROR nodes"| Failed([Step FAILED])
+
     More -->|Yes| Step
     More -->|No| Success([All steps OK])
-    SyntaxCheck -->|"SyntaxError /<br/>ERROR nodes"| Failed([Step FAILED<br/><i>stop execution</i>])
 ```
 
-### Execution Rollback
+### Two-Level Rollback
 
-The agent uses `git stash` for transactional safety:
+**Level 1: Per-primitive rollback** — Each primitive saves the original file content before editing. If postconditions fail (syntax error, node not found after edit), the original file is immediately restored. This prevents a single broken primitive from corrupting the codebase.
+
+**Level 2: Git stash rollback** — The agent uses `git stash` for plan-level transactional safety. If any step fails (after per-primitive rollback), the entire plan's changes are rolled back.
 
 ```mermaid
 flowchart TD
-    Stash["git stash --include-untracked<br/><i>save clean state</i>"] --> Execute[Execute all operators]
+    Stash["git stash --include-untracked<br/><i>save clean state</i>"] --> Execute[Execute all steps]
     Execute --> Check{All succeeded?}
     Check -->|Yes| SubmitPhase[Continue to submit]
     Check -->|No| Pop["git stash pop<br/><i>restore clean state</i>"]
@@ -1279,7 +1404,7 @@ Test evaluation (FAIL_TO_PASS / PASS_TO_PASS) is performed externally by the SWE
 **Before execution**, every operator's preconditions are checked against the code graph via 7 layers of verification. The graph is built from the *current* state of files, so it reflects the actual codebase. Content existence (Layer 1), AST context (Layer 3), scope analysis (Layer 4), preflight syntax (Layer 5), and cross-file impact (Layer 6) are all verified pre-execution.
 
 ### 3. Transactional Execution Invariant
-**If any step fails**, the entire set of changes is rolled back via `git stash pop`. The codebase is never left in a partially-modified state from a failed plan.
+**If any primitive step fails**, the individual file is immediately rolled back to its pre-edit state (per-primitive rollback). **If the overall plan fails**, the entire set of changes is rolled back via `git stash pop`. The codebase is never left in a partially-modified state from a failed plan.
 
 ### 4. File Existence Invariant
 **Before execution**, every file referenced in the plan is verified to exist on disk. This prevents operators from silently creating new files or operating on phantoms.
@@ -1288,23 +1413,28 @@ Test evaluation (FAIL_TO_PASS / PASS_TO_PASS) is performed externally by the SWE
 Operators execute **in order**. Later operators see the effects of earlier ones. This means `add_import` followed by `replace_code` that uses the imported symbol will work correctly.
 
 ### 6. Plan Integrity Invariant
-**Extracted JSON arrays are validated** as actual plans (list of dicts with `"op"` key) before being treated as plans. File lists and other JSON arrays from message content are rejected.
+**Extracted JSON is validated** as an actual plan before being treated as one. Accepted formats: list of dicts with `"op"` key, or object with `"plan"` key containing such a list. File lists and other JSON from message content are rejected.
+
+### 7. Locator Freshness Invariant
+**Every primitive re-queries the live AST** before operating. Locators are resolved against the current parse tree, not cached results. This means step N+1 always sees the effects of step N, eliminating line-drift issues.
 
 ## Verification Pipeline Summary
 
 ```mermaid
 flowchart TD
-    Start([Plan generated by LLM]) --> Verify
+    Start([Plan generated by LLM]) --> Format["Parse plan format<br/>(array or object)"]
+    Format --> Verify
 
-    subgraph Verify ["7-Layer Precondition Verification"]
+    subgraph Verify ["Verification Layers"]
         V0["Layer 0: Schema + File + Graph + Bounds"]
-        V1["Layer 1: Content Existence + Fuzzy Match"]
+        V0b["Layer 0b: Locator Preconditions<br/>(primitive ops only)"]
+        V1["Layer 1: Content Existence + Fuzzy Match<br/>(legacy ops only)"]
         V3["Layer 3: AST Context Check"]
         V4["Layer 4: Scope Analysis"]
         V5["Layer 5: Preflight Syntax"]
-        V2["Layer 2: Line Drift (post-loop)"]
-        V6["Layer 6: Cross-File Impact (post-loop)"]
-        V0 --> V1 --> V3 --> V4 --> V5
+        V2["Layer 2: Line Drift<br/>(legacy ops only)"]
+        V6["Layer 6: Cross-File Impact"]
+        V0 --> V0b --> V1 --> V3 --> V4 --> V5
         V5 -.-> V2 --> V6
     end
 
@@ -1313,13 +1443,17 @@ flowchart TD
     Revise1 --> Verify
 
     subgraph Exec ["Execution (per step)"]
-        X1[Read file] --> X2[Apply transform] --> X3[Write file] --> X4{"_syntax_check()<br/>postcondition"}
+        Route{Primitive?}
+        Route -->|Yes| Prim["_execute_primitive()<br/>pre-check → edit → post-check<br/>→ rollback on failure"]
+        Route -->|No| Legacy["Legacy exec<br/>apply → syntax check"]
     end
 
-    X4 -->|OK| NextStep{More steps?}
-    NextStep -->|Yes| X1
+    Prim -->|OK| NextStep{More steps?}
+    Legacy -->|OK| NextStep
+    NextStep -->|Yes| Route
     NextStep -->|No| Submit
-    X4 -->|FAIL| Rollback["Rollback<br/><i>git stash pop</i>"]
+    Prim -->|FAIL| Rollback["Rollback<br/><i>per-primitive + git stash pop</i>"]
+    Legacy -->|FAIL| Rollback
     Rollback --> Revise2[Revise plan]
     Revise2 --> Verify
 

@@ -1264,3 +1264,640 @@ def test_verify_plan_output_has_warnings_field():
         assert "errors" in result
     finally:
         os.unlink(tmp)
+
+
+# ============================================================
+# AST-Node Transformation Primitives Tests
+# ============================================================
+
+
+def test_normalized_kinds_map():
+    """Test NORMALIZED_KINDS map has expected structure."""
+    ns = _get_helper_ns()
+    kinds = ns["NORMALIZED_KINDS"]
+
+    assert "function" in kinds
+    assert "class" in kinds
+    assert "method" in kinds
+    assert "import" in kinds
+    assert "statement" in kinds
+
+    # Python function should map to function_definition
+    assert "function_definition" in kinds["function"]["python"]
+    # JavaScript function should include function_declaration
+    assert "function_declaration" in kinds["function"]["javascript"]
+    # Python class should map to class_definition
+    assert "class_definition" in kinds["class"]["python"]
+
+
+def test_get_normalized_node_types():
+    """Test _get_normalized_node_types returns correct types."""
+    ns = _get_helper_ns()
+    fn = ns["_get_normalized_node_types"]
+
+    assert "function_definition" in fn("function", "python")
+    assert "class_definition" in fn("class", "python")
+    assert "function_declaration" in fn("function", "javascript")
+    assert fn("nonexistent_kind", "python") == []
+    assert fn("function", "nonexistent_lang") == []
+
+
+def test_resolve_locator_function():
+    """Test resolve_locator finds a function by kind+name."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello():\n    return 'world'\n\ndef goodbye():\n    return 'bye'\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        resolve = ns["resolve_locator"]
+        nodes = resolve({"kind": "function", "name": "hello", "file": tmp})
+        assert len(nodes) == 1
+        assert nodes[0].start_point[0] == 0  # line 0 (0-indexed)
+
+        nodes = resolve({"kind": "function", "name": "goodbye", "file": tmp})
+        assert len(nodes) == 1
+        assert nodes[0].start_point[0] == 3  # line 3 (0-indexed)
+
+        nodes = resolve({"kind": "function", "name": "nonexistent", "file": tmp})
+        assert len(nodes) == 0
+    finally:
+        os.unlink(tmp)
+
+
+def test_resolve_locator_class():
+    """Test resolve_locator finds a class by kind+name."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("class MyClass:\n    def method(self):\n        pass\n\nclass Other:\n    pass\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        resolve = ns["resolve_locator"]
+        nodes = resolve({"kind": "class", "name": "MyClass", "file": tmp})
+        assert len(nodes) == 1
+
+        nodes = resolve({"kind": "class", "name": "Other", "file": tmp})
+        assert len(nodes) == 1
+    finally:
+        os.unlink(tmp)
+
+
+def test_resolve_locator_with_parent():
+    """Test resolve_locator with parent constraint finds method inside class."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(
+            "def standalone():\n    pass\n\n"
+            "class MyClass:\n    def method(self):\n        pass\n"
+        )
+        f.flush()
+        tmp = f.name
+
+    try:
+        resolve = ns["resolve_locator"]
+        # Find method inside MyClass
+        nodes = resolve({
+            "kind": "function", "name": "method", "file": tmp,
+            "parent": {"kind": "class", "name": "MyClass", "file": tmp}
+        })
+        assert len(nodes) == 1
+        assert nodes[0].start_point[0] == 4  # line 4 (0-indexed)
+    finally:
+        os.unlink(tmp)
+
+
+def test_resolve_locator_with_field():
+    """Test resolve_locator with field selection."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello(x, y):\n    return x + y\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        resolve = ns["resolve_locator"]
+        # Get the body of hello function
+        nodes = resolve({"kind": "function", "name": "hello", "file": tmp, "field": "body"})
+        assert len(nodes) == 1
+        text = ns["_node_text"](nodes[0])
+        assert "return" in text
+    finally:
+        os.unlink(tmp)
+
+
+def test_resolve_locator_with_index():
+    """Test resolve_locator with index disambiguation."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("import os\nimport sys\nimport json\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        resolve = ns["resolve_locator"]
+        # Find all imports
+        all_imports = resolve({"kind": "import", "file": tmp})
+        assert len(all_imports) >= 3
+
+        # Find first import
+        first = resolve({"kind": "import", "file": tmp, "index": 0})
+        assert len(first) == 1
+
+        # Find second import
+        second = resolve({"kind": "import", "file": tmp, "index": 1})
+        assert len(second) == 1
+        assert first[0].start_byte != second[0].start_byte
+    finally:
+        os.unlink(tmp)
+
+
+def test_resolve_locator_sexp():
+    """Test S-expression locator mode."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello():\n    return 'world'\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        resolve = ns["resolve_locator"]
+        nodes = resolve({
+            "type": "sexp", "file": tmp,
+            "query": "(function_definition name: (identifier) @id)",
+            "capture": "id",
+        })
+        assert len(nodes) == 1
+        assert ns["_node_text"](nodes[0]) == "hello"
+    finally:
+        os.unlink(tmp)
+
+
+# ============================================================
+# Mutator Primitive Tests
+# ============================================================
+
+
+def test_prim_replace_node():
+    """Test replace_node primitive replaces function body."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello():\n    return 'world'\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        execute_prim = ns["_execute_primitive"]
+        result = execute_prim("replace_node", {
+            "locator": {"kind": "function", "name": "hello", "file": tmp, "field": "body"},
+            "replacement": "\n    return 'universe'\n",
+        })
+        assert result["success"] is True
+        content = open(tmp).read()
+        assert "universe" in content
+        assert "world" not in content
+    finally:
+        os.unlink(tmp)
+
+
+def test_prim_insert_after():
+    """Test insert_after_node primitive."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("import os\n\ndef hello():\n    pass\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        execute_prim = ns["_execute_primitive"]
+        result = execute_prim("insert_after_node", {
+            "locator": {"kind": "import", "file": tmp, "index": 0},
+            "code": "import sys",
+        })
+        assert result["success"] is True
+        content = open(tmp).read()
+        assert "import sys" in content
+    finally:
+        os.unlink(tmp)
+
+
+def test_prim_delete_node():
+    """Test delete_node primitive."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("import os\nimport sys\n\ndef hello():\n    pass\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        execute_prim = ns["_execute_primitive"]
+        result = execute_prim("delete_node", {
+            "locator": {"kind": "import", "file": tmp, "index": 1},
+        })
+        assert result["success"] is True
+        content = open(tmp).read()
+        assert "import os" in content
+        assert "import sys" not in content
+    finally:
+        os.unlink(tmp)
+
+
+def test_prim_wrap_node():
+    """Test wrap_node primitive."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("x = dangerous_call()\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        execute_prim = ns["_execute_primitive"]
+        result = execute_prim("wrap_node", {
+            "locator": {"kind": "statement", "file": tmp, "index": 0},
+            "before": "try:",
+            "after": "except Exception:\n    x = None",
+        })
+        assert result["success"] is True
+        content = open(tmp).read()
+        assert "try:" in content
+        assert "except Exception:" in content
+    finally:
+        os.unlink(tmp)
+
+
+def test_prim_rollback_on_syntax_error():
+    """Test that mutator rolls back on syntax error postcondition failure."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        original = "def hello():\n    return 'world'\n"
+        f.write(original)
+        f.flush()
+        tmp = f.name
+
+    try:
+        execute_prim = ns["_execute_primitive"]
+        result = execute_prim("replace_node", {
+            "locator": {"kind": "function", "name": "hello", "file": tmp, "field": "body"},
+            "replacement": "\n    return ('broken\n",  # broken syntax
+        })
+        assert result["success"] is False
+        assert result.get("rolled_back") is True
+        # Verify original content is restored
+        content = open(tmp).read()
+        assert content == original
+    finally:
+        os.unlink(tmp)
+
+
+def test_prim_precondition_no_match():
+    """Test precondition failure when locator matches nothing."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("x = 1\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        execute_prim = ns["_execute_primitive"]
+        result = execute_prim("replace_node", {
+            "locator": {"kind": "function", "name": "nonexistent", "file": tmp},
+            "replacement": "new code",
+        })
+        assert result["success"] is False
+        assert "not found" in result.get("error", "").lower() or "Node" in result.get("error", "")
+    finally:
+        os.unlink(tmp)
+
+
+# ============================================================
+# Verifier Tests
+# ============================================================
+
+
+def test_verify_node_exists():
+    """Test _verify_node_exists with existing node."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello():\n    pass\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        ok, err = ns["_verify_node_exists"]({"kind": "function", "name": "hello", "file": tmp})
+        assert ok is True
+
+        ok, err = ns["_verify_node_exists"]({"kind": "function", "name": "nope", "file": tmp})
+        assert ok is False
+    finally:
+        os.unlink(tmp)
+
+
+def test_verify_node_absent():
+    """Test _verify_node_absent with absent node."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("x = 1\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        ok, err = ns["_verify_node_absent"]({"kind": "function", "name": "hello", "file": tmp})
+        assert ok is True
+
+        ok, err = ns["_verify_node_absent"]({"kind": "statement", "file": tmp})
+        assert ok is False
+    finally:
+        os.unlink(tmp)
+
+
+# ============================================================
+# DSL Interpreter Tests
+# ============================================================
+
+
+def test_resolve_var_string():
+    """Test resolve_var with string templates."""
+    ns = _get_helper_ns()
+    resolve = ns["resolve_var"]
+
+    assert resolve("$name", {"name": "hello"}) == "hello"
+    assert resolve("prefix_$name_suffix", {"name": "hello"}) == "prefix_hello_suffix"
+    assert resolve("$x + $y", {"x": "1", "y": "2"}) == "1 + 2"
+
+
+def test_resolve_var_dict():
+    """Test resolve_var with dict templates."""
+    ns = _get_helper_ns()
+    resolve = ns["resolve_var"]
+
+    result = resolve({"key": "$val"}, {"val": "resolved"})
+    assert result == {"key": "resolved"}
+
+
+def test_resolve_var_list():
+    """Test resolve_var with list templates."""
+    ns = _get_helper_ns()
+    resolve = ns["resolve_var"]
+
+    result = resolve(["$a", "$b"], {"a": "1", "b": "2"})
+    assert result == ["1", "2"]
+
+
+def test_resolve_var_direct_reference():
+    """Test resolve_var direct $var reference returns non-string value."""
+    ns = _get_helper_ns()
+    resolve = ns["resolve_var"]
+
+    result = resolve("$data", {"data": {"nested": True}})
+    assert result == {"nested": True}
+
+
+def test_expand_composed_operator():
+    """Test expand_composed_operator with built-in add_method."""
+    ns = _get_helper_ns()
+    expand = ns["expand_composed_operator"]
+
+    steps, variables = expand("add_method", {
+        "file": "query.py",
+        "class_name": "QuerySet",
+        "method_code": "    def my_method(self):\n        pass",
+    })
+    assert steps is not None
+    assert len(steps) > 0
+    assert steps[0]["primitive"] == "insert_after_node"
+    assert variables["file"] == "query.py"
+    assert variables["class_name"] == "QuerySet"
+
+
+def test_expand_custom_operator():
+    """Test expand_composed_operator with custom-defined operator."""
+    ns = _get_helper_ns()
+    expand = ns["expand_composed_operator"]
+
+    custom_ops = [
+        {
+            "define": "my_custom_op",
+            "params_schema": {"file": "string", "name": "string"},
+            "steps": [
+                {"primitive": "locate", "params": {"locator": {"kind": "function", "name": "$name", "file": "$file"}}}
+            ]
+        }
+    ]
+
+    steps, variables = expand("my_custom_op", {"file": "test.py", "name": "foo"}, custom_ops)
+    assert steps is not None
+    assert len(steps) == 1
+    assert steps[0]["primitive"] == "locate"
+
+
+def test_expand_unknown_operator():
+    """Test expand_composed_operator with unknown operator returns error."""
+    ns = _get_helper_ns()
+    expand = ns["expand_composed_operator"]
+
+    steps, error = expand("nonexistent_op", {})
+    assert steps is None
+    assert "Unknown" in error
+
+
+# ============================================================
+# Verify plan with new format tests
+# ============================================================
+
+
+def test_verify_plan_primitive_ops():
+    """Test verify_plan accepts primitive ops."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello():\n    return 'world'\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "replace_node", "params": {
+            "locator": {"kind": "function", "name": "hello", "file": tmp, "field": "body"},
+            "replacement": "\n    return 'universe'\n",
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert result["passed"] is True
+    finally:
+        os.unlink(tmp)
+
+
+def test_verify_plan_primitive_locator_no_match():
+    """Test verify_plan catches locator that matches nothing."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("x = 1\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan = [{"op": "replace_node", "params": {
+            "locator": {"kind": "function", "name": "nonexistent", "file": tmp},
+            "replacement": "new code",
+        }}]
+        result = _run_verify(ns, plan, {"symbols": [], "imports": [], "line_kinds": {}})
+        assert result["passed"] is False
+        assert any("0 nodes" in e for e in result["errors"])
+    finally:
+        os.unlink(tmp)
+
+
+def test_verify_plan_object_format():
+    """Test verify_plan with object format {define_operators, plan}."""
+    ns = _get_helper_ns()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("x = 1\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        plan_data = {
+            "define_operators": [
+                {"define": "my_op", "params_schema": {"file": "string"},
+                 "steps": [{"primitive": "locate", "params": {"locator": {"kind": "statement", "file": "$file"}}}]}
+            ],
+            "plan": [
+                {"op": "replace_code", "params": {"file": tmp, "pattern": "x = 1", "replacement": "x = 2"}}
+            ]
+        }
+
+        import io
+        from contextlib import redirect_stdout
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            ns["verify_plan"](json.dumps(plan_data), json.dumps({"symbols": [], "imports": [], "line_kinds": {}}))
+        result = json.loads(captured.getvalue().strip())
+        assert result["passed"] is True
+    finally:
+        os.unlink(tmp)
+
+
+# ============================================================
+# _is_valid_plan tests for new format
+# ============================================================
+
+
+def test_is_valid_plan_object_format(graphplan_config):
+    """Test _is_valid_plan accepts object format."""
+    agent = GraphPlanAgent(
+        model=DeterministicToolcallModel(outputs=[]),
+        env=LocalEnvironment(),
+        **graphplan_config,
+    )
+
+    # Object format with plan
+    plan = {"define_operators": [], "plan": [{"op": "replace_code", "params": {}}]}
+    assert agent._is_valid_plan(plan) is True
+
+    # Object format with empty plan
+    plan = {"define_operators": [], "plan": []}
+    assert agent._is_valid_plan(plan) is False
+
+    # Array format (backward compatible)
+    plan = [{"op": "replace_code", "params": {}}]
+    assert agent._is_valid_plan(plan) is True
+
+
+def test_extract_plan_json_from_text_object_format():
+    """Test _extract_plan_json_from_text handles object format."""
+    # Object format in code block
+    text = '```json\n{"define_operators": [], "plan": [{"op": "replace_node", "params": {"locator": {"kind": "function"}}}]}\n```'
+    result = GraphPlanAgent._extract_plan_json_from_text(text)
+    assert '"replace_node"' in result
+
+    # Raw object format
+    text = 'Here is the plan: {"define_operators": [], "plan": [{"op": "delete_node", "params": {"locator": {}}}]}'
+    result = GraphPlanAgent._extract_plan_json_from_text(text)
+    assert '"delete_node"' in result
+
+
+def test_execute_locate():
+    """Test execute_step with locate (read-only) primitive."""
+    ts_langs = pytest.importorskip("tree_sitter_languages")
+
+    ns = _get_helper_ns()
+    ns["_treesitter_available"] = True
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello():\n    pass\n\ndef world():\n    pass\n")
+        f.flush()
+        tmp = f.name
+
+    try:
+        locate = ns["_execute_locate"]
+        result = locate("locate", {"locator": {"kind": "function", "file": tmp}})
+        assert result["success"] is True
+        assert result["count"] == 2
+        assert result["found"] is True
+        assert len(result["nodes"]) == 2
+    finally:
+        os.unlink(tmp)

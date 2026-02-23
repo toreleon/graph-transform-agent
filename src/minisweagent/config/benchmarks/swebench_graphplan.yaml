@@ -20,10 +20,12 @@ agent:
     ### Phase 2: Plan Execution
     After you signal READY_TO_PLAN, the system will:
     1. Build a code graph (AST/tree-sitter analysis) of your listed files
-       - Python files use AST; JavaScript, TypeScript, Java, Go, Rust, Ruby, PHP, C, and C++ use tree-sitter
-    2. Ask you to generate an edit plan using structured operators
-    3. Verify the plan against the code graph
-    4. Execute the plan automatically
+    2. Ask you to generate an edit plan using AST-node primitives or structured operators
+       - AST-node primitives use locators to find targets structurally (no line numbers needed)
+       - Locators re-query the live AST on every step, eliminating line-drift issues
+       - You can also define custom composed operators for reuse within the plan
+    3. Verify the plan against the code graph (including locator-based precondition checks)
+    4. Execute the plan automatically with rollback on failure
 
     You will then review the changes and submit a patch.
 

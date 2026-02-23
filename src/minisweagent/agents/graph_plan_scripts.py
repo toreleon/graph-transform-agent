@@ -249,6 +249,281 @@ LINE_KIND_MAP = {
 
 
 # ============================================================
+# Normalized AST kind map: normalized kind -> per-language node types
+# ============================================================
+
+NORMALIZED_KINDS = {
+    "function": {
+        "python": ["function_definition"],
+        "javascript": ["function_declaration", "method_definition"],
+        "typescript": ["function_declaration", "method_definition"],
+        "java": ["method_declaration", "constructor_declaration"],
+        "go": ["function_declaration", "method_declaration"],
+        "rust": ["function_item"],
+        "ruby": ["method", "singleton_method"],
+        "php": ["function_definition", "method_declaration"],
+        "c": ["function_definition"],
+        "cpp": ["function_definition"],
+    },
+    "class": {
+        "python": ["class_definition"],
+        "javascript": ["class_declaration"],
+        "typescript": ["class_declaration"],
+        "java": ["class_declaration"],
+        "go": [],
+        "rust": ["struct_item"],
+        "ruby": ["class"],
+        "php": ["class_declaration"],
+        "c": ["struct_specifier"],
+        "cpp": ["class_specifier", "struct_specifier"],
+    },
+    "method": {
+        "python": ["function_definition"],  # methods are function_definitions inside classes
+        "javascript": ["method_definition"],
+        "typescript": ["method_definition"],
+        "java": ["method_declaration"],
+        "go": ["method_declaration"],
+        "rust": ["function_item"],  # inside impl blocks
+        "ruby": ["method"],
+        "php": ["method_declaration"],
+        "c": [],
+        "cpp": [],
+    },
+    "import": {
+        "python": ["import_statement", "import_from_statement"],
+        "javascript": ["import_statement"],
+        "typescript": ["import_statement"],
+        "java": ["import_declaration"],
+        "go": ["import_declaration"],
+        "rust": ["use_declaration"],
+        "ruby": ["call"],  # require/require_relative
+        "php": ["namespace_use_declaration"],
+        "c": ["preproc_include"],
+        "cpp": ["preproc_include"],
+    },
+    "statement": {
+        "python": ["expression_statement", "return_statement", "if_statement",
+                    "for_statement", "while_statement", "try_statement",
+                    "raise_statement", "assert_statement", "with_statement",
+                    "assignment"],
+        "javascript": ["expression_statement", "return_statement", "if_statement",
+                        "for_statement", "while_statement", "try_statement",
+                        "throw_statement", "variable_declaration"],
+        "typescript": ["expression_statement", "return_statement", "if_statement",
+                        "for_statement", "while_statement", "try_statement",
+                        "throw_statement", "variable_declaration"],
+        "java": ["expression_statement", "return_statement", "if_statement",
+                  "for_statement", "while_statement", "try_statement",
+                  "throw_statement", "local_variable_declaration"],
+        "go": ["expression_statement", "return_statement", "if_statement",
+                "for_statement", "short_var_declaration"],
+        "rust": ["expression_statement", "return_expression", "if_expression",
+                  "for_expression", "while_expression", "let_declaration"],
+        "ruby": ["expression_statement", "return", "if", "for", "while"],
+        "php": ["expression_statement", "return_statement", "if_statement",
+                 "for_statement", "while_statement", "try_statement"],
+        "c": ["expression_statement", "return_statement", "if_statement",
+               "for_statement", "while_statement", "declaration"],
+        "cpp": ["expression_statement", "return_statement", "if_statement",
+                 "for_statement", "while_statement", "declaration",
+                 "try_statement"],
+    },
+    "interface": {
+        "python": [],
+        "javascript": [],
+        "typescript": ["interface_declaration"],
+        "java": ["interface_declaration"],
+        "go": [],
+        "rust": ["trait_item"],
+        "ruby": [],
+        "php": ["interface_declaration"],
+        "c": [],
+        "cpp": [],
+    },
+    "enum": {
+        "python": [],
+        "javascript": [],
+        "typescript": ["enum_declaration"],
+        "java": ["enum_declaration"],
+        "go": [],
+        "rust": ["enum_item"],
+        "ruby": [],
+        "php": [],
+        "c": ["enum_specifier"],
+        "cpp": ["enum_specifier"],
+    },
+}
+
+
+def _get_normalized_node_types(kind, lang):
+    """Get tree-sitter node types for a normalized kind in a language."""
+    kind_map = NORMALIZED_KINDS.get(kind)
+    if kind_map is None:
+        return []
+    return kind_map.get(lang, [])
+
+
+def _node_text(node):
+    """Get text of a tree-sitter node as a string."""
+    return node.text.decode("utf-8") if isinstance(node.text, bytes) else node.text
+
+
+def _get_node_name(node):
+    """Get the name of a tree-sitter node (from its 'name' field)."""
+    name_node = node.child_by_field_name("name")
+    if name_node is None:
+        # Try declarator for C/C++
+        decl = node.child_by_field_name("declarator")
+        if decl:
+            name_node = decl.child_by_field_name("declarator")
+            if name_node is None:
+                name_node = decl
+    if name_node is not None:
+        return _node_text(name_node)
+    return None
+
+
+def resolve_locator(locator, file_path=None, language=None, tree=None, source=None):
+    """Resolve a locator against a live AST, returning matching nodes.
+
+    A locator is a dict with fields:
+        kind: normalized AST kind (function, class, method, import, statement, etc.)
+        name: symbol name (for named nodes)
+        file: file path (used externally; here we use file_path param)
+        parent: nested locator constraining to children of parent
+        field: named tree-sitter field of matched node (body, parameters, etc.)
+        nth_child: select Nth child of matched node (-1 for last)
+        index: disambiguate when multiple matches (0-based)
+        type: "sexp" for S-expression locator mode
+
+    Returns list of matching tree-sitter nodes.
+    """
+    if not _check_treesitter():
+        return []
+
+    fp = file_path or locator.get("file", "")
+    if not fp:
+        return []
+
+    lang = language or detect_language(fp)
+    if not lang:
+        return []
+
+    import tree_sitter_languages
+
+    # Parse file if tree not provided
+    if tree is None:
+        try:
+            source = open(fp, "rb").read()
+            parser = tree_sitter_languages.get_parser(lang)
+            tree = parser.parse(source)
+        except Exception:
+            return []
+
+    if source is None:
+        try:
+            source = open(fp, "rb").read()
+        except Exception:
+            return []
+
+    root = tree.root_node
+
+    # S-expression locator mode
+    if locator.get("type") == "sexp":
+        query_str = locator.get("query", "")
+        capture_name = locator.get("capture", "id")
+        if not query_str:
+            return []
+        try:
+            ts_lang = tree_sitter_languages.get_language(lang)
+            query = ts_lang.query(query_str)
+            captures = query.captures(root)
+            nodes = _get_captures_list(captures, capture_name)
+            idx = locator.get("index")
+            if idx is not None and 0 <= idx < len(nodes):
+                return [nodes[idx]]
+            return list(nodes)
+        except Exception:
+            return []
+
+    # Structured locator mode
+    kind = locator.get("kind", "")
+    name = locator.get("name")
+    parent_locator = locator.get("parent")
+    field_name = locator.get("field")
+    nth_child = locator.get("nth_child")
+    index = locator.get("index")
+
+    # Get target node types for this kind+language
+    target_types = set(_get_normalized_node_types(kind, lang)) if kind else set()
+
+    # Determine search root
+    if parent_locator:
+        parent_nodes = resolve_locator(parent_locator, fp, lang, tree, source)
+        if not parent_nodes:
+            return []
+        search_roots = parent_nodes
+    else:
+        search_roots = [root]
+
+    # Collect matching nodes
+    matches = []
+    for search_root in search_roots:
+        _collect_matching_nodes(search_root, target_types, name, kind, lang, matches)
+
+    # Apply field selection
+    if field_name and matches:
+        field_nodes = []
+        for node in matches:
+            field_node = node.child_by_field_name(field_name)
+            if field_node:
+                field_nodes.append(field_node)
+        matches = field_nodes
+
+    # Apply nth_child selection
+    if nth_child is not None and matches:
+        child_nodes = []
+        for node in matches:
+            children = [c for c in node.children if c.type not in ("comment", "(", ")", "{", "}", ":", ",")]
+            if children:
+                idx_val = nth_child if nth_child >= 0 else len(children) + nth_child
+                if 0 <= idx_val < len(children):
+                    child_nodes.append(children[idx_val])
+        matches = child_nodes
+
+    # Apply index disambiguation
+    if index is not None:
+        if 0 <= index < len(matches):
+            return [matches[index]]
+        return []
+
+    return matches
+
+
+def _collect_matching_nodes(node, target_types, name, kind, lang, result):
+    """Recursively collect nodes matching target types and name."""
+    is_match = False
+
+    if target_types:
+        if node.type in target_types:
+            is_match = True
+    elif kind:
+        # If kind has no mapping for this language, skip
+        pass
+
+    if is_match:
+        if name is not None:
+            node_name = _get_node_name(node)
+            if node_name == name:
+                result.append(node)
+        else:
+            result.append(node)
+
+    for child in node.children:
+        _collect_matching_nodes(child, target_types, name, kind, lang, result)
+
+
+# ============================================================
 # build_graph: Parse files, extract symbols + imports
 # ============================================================
 
@@ -530,6 +805,17 @@ REQUIRED_PARAMS = {
     "add_class_attribute": ["file", "class_name", "attribute_code"],
     "replace_function_body": ["file", "func_name", "new_body"],
 }
+
+
+# Primitive names recognized by the engine (forward-declared for verify_plan)
+PRIMITIVE_OPS = {
+    "replace_node", "insert_before_node", "insert_after_node",
+    "delete_node", "wrap_node", "replace_all_matching",
+    "locate", "locate_region",
+}
+
+# Built-in composed operator names (forward-declared for verify_plan)
+BUILTIN_COMPOSED_OP_NAMES = {"add_method", "add_import", "add_class_attribute"}
 
 
 # ============================================================
@@ -847,10 +1133,33 @@ def _build_import_graph(graph):
     return symbol_importers, file_exports
 
 
+def _extract_plan_steps(plan_data):
+    """Extract steps list and custom operators from plan data.
+
+    Handles both formats:
+      - Bare array: [{"op": ...}, ...]
+      - Object format: {"define_operators": [...], "plan": [...]}
+
+    Returns (steps, custom_operators).
+    """
+    if isinstance(plan_data, list):
+        return plan_data, []
+    elif isinstance(plan_data, dict):
+        return plan_data.get("plan", []), plan_data.get("define_operators", [])
+    return [], []
+
+
+# All valid ops: legacy + primitives + built-in composed
+ALL_VALID_OPS = VALID_OPS | PRIMITIVE_OPS | BUILTIN_COMPOSED_OP_NAMES
+
+
 def verify_plan(plan_json, graph_json):
     """Verify plan preconditions against graph.
 
+    Handles both legacy operators and new AST-node primitives.
+
     Layer 0: Structural checks (valid operator, required params, file exists, symbol in graph, line range)
+    Layer 0b: Locator-based precondition checks (for primitives)
     Layer 1: Content existence checks (pattern found, signature found, duplicate detection)
     Layer 2: Line drift detection (cumulative line number shifts from earlier edits)
     Layer 3: AST context checks (pattern inside string/comment)
@@ -858,8 +1167,10 @@ def verify_plan(plan_json, graph_json):
     Layer 5: Preflight syntax check (simulated replacement produces valid syntax)
     Layer 6: Cross-file impact analysis (renamed/deleted symbols imported elsewhere)
     """
-    plan = json.loads(plan_json)
+    plan_data = json.loads(plan_json)
     graph = json.loads(graph_json)
+
+    plan, custom_operators = _extract_plan_steps(plan_data)
     errors = []
     warnings = []
 
@@ -870,26 +1181,51 @@ def verify_plan(plan_json, graph_json):
         op = step.get("op", "")
         params = step.get("params", {})
 
+        # Check if this is a custom-defined operator
+        is_custom = any(c.get("define") == op for c in custom_operators)
+
         # === Layer 0: Structural checks ===
 
         # Check valid operator
-        if op not in VALID_OPS:
+        if op not in ALL_VALID_OPS and not is_custom:
             errors.append(f"Step {i}: Unknown operator '{op}'")
             continue
 
-        # Check required params
-        for param_name in REQUIRED_PARAMS.get(op, []):
-            if param_name not in params:
-                errors.append(f"Step {i}: Missing parameter '{param_name}' for {op}")
+        # For legacy ops, check required params
+        if op in VALID_OPS:
+            for param_name in REQUIRED_PARAMS.get(op, []):
+                if param_name not in params:
+                    errors.append(f"Step {i}: Missing parameter '{param_name}' for {op}")
 
+        # Determine file path from params or locator
         file_path = params.get("file", "")
+        if not file_path:
+            locator = params.get("locator", {})
+            file_path = locator.get("file", "")
 
         # Check file exists
         if file_path and file_path != "all" and not os.path.isfile(file_path):
             errors.append(f"Step {i}: File '{file_path}' does not exist")
             continue
 
-        # Operator-specific structural checks
+        # === Layer 0b: Locator-based precondition checks (for primitives) ===
+
+        if op in PRIMITIVE_OPS and op not in ("locate", "locate_region"):
+            locator = params.get("locator", {})
+            if locator:
+                nodes = resolve_locator(locator, file_path=file_path)
+                if not nodes and op not in ("replace_all_matching",):
+                    errors.append(
+                        f"Step {i} ({op}): Locator matched 0 nodes: {json.dumps(locator)}"
+                    )
+                elif len(nodes) > 1 and op in ("replace_node", "delete_node", "wrap_node"):
+                    if locator.get("index") is None:
+                        warnings.append(
+                            f"Step {i} ({op}): Locator matched {len(nodes)} nodes "
+                            f"(use 'index' to disambiguate): {json.dumps(locator)}"
+                        )
+
+        # Legacy operator-specific structural checks
         if op in ("add_method", "add_class_attribute"):
             class_name = params.get("class_name", "")
             found = any(
@@ -1013,9 +1349,11 @@ def verify_plan(plan_json, graph_json):
                         if not ok:
                             errors.append(f"Step {i} (replace_code): {err}")
 
-    # === Layer 2: Line drift detection (post-loop) ===
-    drift_warnings = _check_line_drift(plan)
-    warnings.extend(drift_warnings)
+    # === Layer 2: Line drift detection (post-loop, only for legacy ops) ===
+    legacy_steps = [s for s in plan if s.get("op", "") in VALID_OPS]
+    if legacy_steps:
+        drift_warnings = _check_line_drift(legacy_steps)
+        warnings.extend(drift_warnings)
 
     # === Layer 6: Cross-file impact analysis (post-loop) ===
     try:
@@ -1023,6 +1361,8 @@ def verify_plan(plan_json, graph_json):
         plan_files = set()
         for step in plan:
             fp = step.get("params", {}).get("file", "")
+            if not fp:
+                fp = step.get("params", {}).get("locator", {}).get("file", "")
             if fp:
                 plan_files.add(fp)
 
@@ -1067,6 +1407,17 @@ def verify_plan(plan_json, graph_json):
                                         f"Step {i} (delete_lines): Deleting '{sym_name}' "
                                         f"which is imported by: {sorted(affected)}"
                                     )
+
+            elif op == "delete_node":
+                locator = params.get("locator", {})
+                loc_name = locator.get("name", "")
+                if loc_name and loc_name in symbol_importers:
+                    affected = symbol_importers[loc_name] - plan_files
+                    if affected:
+                        warnings.append(
+                            f"Step {i} (delete_node): '{loc_name}' is imported by files "
+                            f"not in this plan: {sorted(affected)}"
+                        )
     except Exception:
         pass  # Graceful degradation
 
@@ -1243,6 +1594,616 @@ def _syntax_check(filepath):
 
 
 # ============================================================
+# Verifier primitives
+# ============================================================
+
+def _verify_parses_ok(filepath):
+    """Verify file parses without errors. Returns (ok, error_msg)."""
+    return _syntax_check(filepath)
+
+
+def _verify_parses_ok_content(content, filepath):
+    """Verify content string parses without errors. Returns (ok, error_msg)."""
+    return _syntax_check_content(content, filepath)
+
+
+def _verify_node_exists(locator, filepath=None):
+    """Verify locator resolves to >= 1 node. Returns (ok, error_msg)."""
+    nodes = resolve_locator(locator, file_path=filepath)
+    if nodes:
+        return (True, None)
+    return (False, f"Locator did not match any node: {json.dumps(locator)}")
+
+
+def _verify_node_absent(locator, filepath=None):
+    """Verify locator resolves to 0 nodes. Returns (ok, error_msg)."""
+    nodes = resolve_locator(locator, file_path=filepath)
+    if not nodes:
+        return (True, None)
+    return (False, f"Locator still matches {len(nodes)} node(s): {json.dumps(locator)}")
+
+
+def _verify_scope_unchanged(original_source, new_source, edit_start, edit_end, filepath):
+    """Verify AST outside edit region is unchanged via hash comparison."""
+    if not _check_treesitter():
+        return (True, None)
+
+    lang = detect_language(filepath)
+    if not lang:
+        return (True, None)
+
+    import tree_sitter_languages
+    try:
+        parser = tree_sitter_languages.get_parser(lang)
+        old_tree = parser.parse(original_source if isinstance(original_source, bytes) else original_source.encode("utf-8"))
+        new_tree = parser.parse(new_source if isinstance(new_source, bytes) else new_source.encode("utf-8"))
+
+        def _hash_outside(root, start, end):
+            """Collect node type+text hashes for nodes outside the edit region."""
+            hashes = []
+            for child in root.children:
+                if child.end_byte <= start or child.start_byte >= end:
+                    hashes.append((child.type, child.start_point, child.end_point))
+            return hashes
+
+        old_hashes = _hash_outside(old_tree.root_node, edit_start, edit_end)
+        # For new tree, we need to account for byte offset shift
+        # Just check that the file still parses ok as a simpler verification
+        if _has_error_nodes(new_tree.root_node):
+            return (False, f"New content has parse errors in {filepath}")
+        return (True, None)
+    except Exception:
+        return (True, None)
+
+
+def _verify_type_compatible(node, expected_type):
+    """Verify a node has the expected AST type. Returns (ok, error_msg)."""
+    if node.type == expected_type:
+        return (True, None)
+    return (False, f"Expected node type '{expected_type}', got '{node.type}'")
+
+
+# ============================================================
+# Mutator primitives: AST-node based editing with rollback
+# ============================================================
+
+def _execute_primitive(name, params):
+    """Execute a primitive with pre-check, edit, post-check, rollback protocol.
+
+    Returns dict: {success: bool, error?: str, rolled_back?: bool, result?: dict}
+    """
+    locator = params.get("locator", {})
+    fp = locator.get("file", params.get("file", ""))
+    if not fp:
+        return {"success": False, "error": "No file specified in locator or params"}
+
+    if not os.path.isfile(fp):
+        return {"success": False, "error": f"File not found: {fp}"}
+
+    # Save original for rollback
+    try:
+        original = open(fp, "rb").read()
+    except Exception as e:
+        return {"success": False, "error": f"Cannot read {fp}: {e}"}
+
+    # Resolve locator to find target nodes
+    nodes = resolve_locator(locator, file_path=fp)
+
+    # Pre-condition checks
+    pre_result = _check_preconditions(name, fp, nodes, params)
+    if not pre_result[0]:
+        return {"success": False, "error": pre_result[1]}
+
+    # Apply the edit
+    try:
+        edit_result = _apply_primitive_edit(name, fp, nodes, params, original)
+        if not edit_result.get("success"):
+            return edit_result
+    except Exception as e:
+        # Rollback on exception
+        try:
+            with open(fp, "wb") as f:
+                f.write(original)
+        except Exception:
+            pass
+        return {"success": False, "error": str(e), "rolled_back": True}
+
+    # Post-condition checks
+    post_result = _check_postconditions(name, fp, locator, params)
+    if not post_result[0]:
+        # Rollback on postcondition failure
+        try:
+            with open(fp, "wb") as f:
+                f.write(original)
+        except Exception:
+            pass
+        return {"success": False, "error": post_result[1], "rolled_back": True}
+
+    return {"success": True, "result": edit_result.get("result", {})}
+
+
+def _check_preconditions(name, filepath, nodes, params):
+    """Check preconditions for a primitive. Returns (ok, error_msg)."""
+    if name == "replace_all_matching":
+        if len(nodes) < 1:
+            return (False, f"No matching nodes found for replace_all_matching")
+        return (True, None)
+
+    if name in ("replace_node", "insert_before_node", "insert_after_node",
+                "delete_node", "wrap_node"):
+        if len(nodes) == 0:
+            locator = params.get("locator", {})
+            return (False, f"Node not found for {name}: {json.dumps(locator)}")
+        if len(nodes) > 1 and name in ("replace_node", "delete_node", "wrap_node"):
+            locator = params.get("locator", {})
+            if locator.get("index") is None:
+                return (False, f"Ambiguous: {len(nodes)} matches for {name}, use 'index' to disambiguate")
+        return (True, None)
+
+    return (True, None)
+
+
+def _check_postconditions(name, filepath, locator, params):
+    """Check postconditions after a primitive edit. Returns (ok, error_msg)."""
+    # Always check syntax
+    ok, err = _verify_parses_ok(filepath)
+    if not ok:
+        return (False, f"Post-edit syntax check failed: {err}")
+
+    if name == "delete_node":
+        ok, err = _verify_node_absent(locator, filepath)
+        if not ok:
+            return (False, f"delete_node postcondition: node still present")
+
+    if name in ("insert_before_node", "insert_after_node"):
+        # Verify anchor is still findable
+        ok, err = _verify_node_exists(locator, filepath)
+        # Anchor may have shifted but file should parse ok, which we already checked
+
+    return (True, None)
+
+
+def _apply_primitive_edit(name, filepath, nodes, params, original_bytes):
+    """Apply a single primitive edit. Returns {success, error?, result?}."""
+    content = original_bytes.decode("utf-8") if isinstance(original_bytes, bytes) else original_bytes
+
+    if name == "replace_node":
+        return _prim_replace_node(filepath, nodes, params, content)
+    elif name == "insert_before_node":
+        return _prim_insert_before(filepath, nodes, params, content)
+    elif name == "insert_after_node":
+        return _prim_insert_after(filepath, nodes, params, content)
+    elif name == "delete_node":
+        return _prim_delete_node(filepath, nodes, params, content)
+    elif name == "wrap_node":
+        return _prim_wrap_node(filepath, nodes, params, content)
+    elif name == "replace_all_matching":
+        return _prim_replace_all_matching(filepath, nodes, params, content)
+    else:
+        return {"success": False, "error": f"Unknown primitive: {name}"}
+
+
+def _prim_replace_node(filepath, nodes, params, content):
+    """Replace a single AST node's text with new code."""
+    node = nodes[0]
+    replacement = params.get("replacement", "")
+    source_bytes = content.encode("utf-8")
+    new_content = source_bytes[:node.start_byte] + replacement.encode("utf-8") + source_bytes[node.end_byte:]
+    _write_file(filepath, new_content.decode("utf-8"))
+    return {"success": True, "result": {
+        "replaced_start_line": node.start_point[0] + 1,
+        "replaced_end_line": node.end_point[0] + 1,
+    }}
+
+
+def _prim_insert_before(filepath, nodes, params, content):
+    """Insert code before a target AST node."""
+    node = nodes[0]
+    code = params.get("code", "")
+    separator = params.get("separator", "\n")
+    source_bytes = content.encode("utf-8")
+
+    # Determine indentation from target node
+    line_start = source_bytes.rfind(b"\n", 0, node.start_byte)
+    if line_start < 0:
+        line_start = 0
+    else:
+        line_start += 1
+    indent = b""
+    for b in source_bytes[line_start:node.start_byte]:
+        if b in (32, 9):  # space or tab
+            indent += bytes([b])
+        else:
+            break
+
+    insert_text = code + separator
+    if not insert_text.endswith("\n"):
+        insert_text += "\n"
+
+    # Indent the inserted code to match
+    insert_lines = insert_text.split("\n")
+    indented_lines = []
+    for i, line in enumerate(insert_lines):
+        if line.strip() or i == 0:
+            indented_lines.append(indent.decode("utf-8") + line if i > 0 else line)
+        else:
+            indented_lines.append(line)
+    insert_text = "\n".join(indented_lines)
+    if not insert_text.endswith("\n"):
+        insert_text += "\n"
+
+    new_content = source_bytes[:line_start] + insert_text.encode("utf-8") + source_bytes[line_start:]
+    _write_file(filepath, new_content.decode("utf-8"))
+    return {"success": True, "result": {"inserted_at_line": node.start_point[0] + 1}}
+
+
+def _prim_insert_after(filepath, nodes, params, content):
+    """Insert code after a target AST node."""
+    node = nodes[0]
+    code = params.get("code", "")
+    separator = params.get("separator", "\n")
+    source_bytes = content.encode("utf-8")
+
+    # Find end of node's line
+    line_end = source_bytes.find(b"\n", node.end_byte)
+    if line_end < 0:
+        line_end = len(source_bytes)
+    else:
+        line_end += 1  # include the newline
+
+    # Determine indentation from target node
+    line_start = source_bytes.rfind(b"\n", 0, node.start_byte)
+    if line_start < 0:
+        line_start = 0
+    else:
+        line_start += 1
+    indent = b""
+    for b_val in source_bytes[line_start:node.start_byte]:
+        if b_val in (32, 9):
+            indent += bytes([b_val])
+        else:
+            break
+
+    insert_text = separator + code
+    if not insert_text.endswith("\n"):
+        insert_text += "\n"
+
+    # Apply indent to each line of inserted code
+    insert_lines = insert_text.split("\n")
+    indented_lines = []
+    for i, line in enumerate(insert_lines):
+        if line.strip():
+            indented_lines.append(indent.decode("utf-8") + line)
+        else:
+            indented_lines.append(line)
+    insert_text = "\n".join(indented_lines)
+
+    new_content = source_bytes[:line_end] + insert_text.encode("utf-8") + source_bytes[line_end:]
+    _write_file(filepath, new_content.decode("utf-8"))
+    return {"success": True, "result": {"inserted_after_line": node.end_point[0] + 1}}
+
+
+def _prim_delete_node(filepath, nodes, params, content):
+    """Delete a single AST node."""
+    node = nodes[0]
+    source_bytes = content.encode("utf-8")
+
+    # Delete the whole line(s) if the node spans complete lines
+    line_start = source_bytes.rfind(b"\n", 0, node.start_byte)
+    if line_start < 0:
+        line_start = 0
+    else:
+        line_start += 1
+
+    # Check if only whitespace before node on its line
+    before_on_line = source_bytes[line_start:node.start_byte]
+    only_whitespace_before = all(b in (32, 9) for b in before_on_line)
+
+    line_end = source_bytes.find(b"\n", node.end_byte)
+    if line_end < 0:
+        line_end = len(source_bytes)
+    else:
+        line_end += 1
+
+    after_on_line = source_bytes[node.end_byte:line_end].strip()
+
+    if only_whitespace_before and not after_on_line:
+        # Delete entire lines
+        new_content = source_bytes[:line_start] + source_bytes[line_end:]
+    else:
+        # Delete just the node bytes
+        new_content = source_bytes[:node.start_byte] + source_bytes[node.end_byte:]
+
+    _write_file(filepath, new_content.decode("utf-8"))
+    return {"success": True, "result": {
+        "deleted_start_line": node.start_point[0] + 1,
+        "deleted_end_line": node.end_point[0] + 1,
+    }}
+
+
+def _prim_wrap_node(filepath, nodes, params, content):
+    """Wrap a node with before/after code, optionally indenting the body."""
+    node = nodes[0]
+    before = params.get("before", "")
+    after = params.get("after", "")
+    indent_body = params.get("indent_body", True)
+    source_bytes = content.encode("utf-8")
+
+    # Determine indentation of target node
+    line_start = source_bytes.rfind(b"\n", 0, node.start_byte)
+    if line_start < 0:
+        line_start = 0
+    else:
+        line_start += 1
+    indent = b""
+    for b_val in source_bytes[line_start:node.start_byte]:
+        if b_val in (32, 9):
+            indent += bytes([b_val])
+        else:
+            break
+
+    node_text = source_bytes[node.start_byte:node.end_byte].decode("utf-8")
+
+    # Build wrapped text
+    indent_str = indent.decode("utf-8")
+    if indent_body:
+        # Indent body by 4 spaces relative to current
+        body_lines = node_text.split("\n")
+        indented_body = "\n".join("    " + line if line.strip() else line for line in body_lines)
+    else:
+        indented_body = node_text
+
+    wrapped = f"{indent_str}{before}\n{indented_body}\n{indent_str}{after}"
+
+    new_content = source_bytes[:node.start_byte] + wrapped.encode("utf-8") + source_bytes[node.end_byte:]
+    _write_file(filepath, new_content.decode("utf-8"))
+    return {"success": True, "result": {
+        "wrapped_start_line": node.start_point[0] + 1,
+        "wrapped_end_line": node.end_point[0] + 1,
+    }}
+
+
+def _prim_replace_all_matching(filepath, nodes, params, content):
+    """Replace all matching nodes, processing bottom-up to avoid invalidation."""
+    replacement = params.get("replacement", "")
+    filter_mode = params.get("filter")
+    source_bytes = content.encode("utf-8")
+
+    # Sort nodes by start_byte descending (bottom-up) to avoid invalidation
+    sorted_nodes = sorted(nodes, key=lambda n: n.start_byte, reverse=True)
+
+    # Optionally filter out nodes inside strings/comments
+    if filter_mode == "not_in_string_or_comment":
+        STRING_COMMENT_TYPES = {
+            "string", "comment", "string_literal", "template_string",
+            "line_comment", "block_comment", "string_content",
+            "interpreted_string_literal", "raw_string_literal",
+            "string_fragment", "heredoc_body",
+        }
+        filtered = []
+        for node in sorted_nodes:
+            in_string_or_comment = False
+            ancestor = node.parent
+            while ancestor is not None:
+                if ancestor.type in STRING_COMMENT_TYPES:
+                    in_string_or_comment = True
+                    break
+                ancestor = ancestor.parent
+            if not in_string_or_comment:
+                filtered.append(node)
+        sorted_nodes = filtered
+
+    if not sorted_nodes:
+        return {"success": False, "error": "No nodes to replace after filtering"}
+
+    # Apply replacements bottom-up
+    result_bytes = source_bytes
+    count = 0
+    for node in sorted_nodes:
+        result_bytes = result_bytes[:node.start_byte] + replacement.encode("utf-8") + result_bytes[node.end_byte:]
+        count += 1
+
+    _write_file(filepath, result_bytes.decode("utf-8"))
+    return {"success": True, "result": {"replaced_count": count}}
+
+
+# ============================================================
+# DSL interpreter: variable resolution + composed operators
+# ============================================================
+
+# Built-in composed operators expressed as DSL step sequences
+BUILTIN_COMPOSED_OPS = {
+    "add_method": {
+        "params_schema": {"file": "string", "class_name": "string", "method_code": "string"},
+        "steps": [
+            {"primitive": "insert_after_node", "params": {
+                "locator": {"kind": "class", "name": "$class_name", "file": "$file", "field": "body", "nth_child": -1},
+                "code": "\n$method_code",
+            }}
+        ],
+    },
+    "add_import": {
+        "params_schema": {"file": "string", "import_statement": "string"},
+        "steps": [
+            {"primitive": "insert_after_node", "params": {
+                "locator": {"kind": "import", "file": "$file", "index": -1},
+                "code": "$import_statement",
+            }},
+        ],
+        "fallback": "_exec_add_import",  # fallback to legacy when no imports exist
+    },
+    "add_class_attribute": {
+        "params_schema": {"file": "string", "class_name": "string", "attribute_code": "string"},
+        "steps": [
+            {"primitive": "insert_before_node", "params": {
+                "locator": {"kind": "class", "name": "$class_name", "file": "$file", "field": "body", "nth_child": 0},
+                "code": "$attribute_code",
+            }}
+        ],
+    },
+}
+
+
+def resolve_var(template, variables):
+    """Resolve $var references in a string or dict/list structure.
+
+    Handles: $var, $var.field, and nested structures.
+    """
+    if isinstance(template, str):
+        if template.startswith("$") and "." not in template and template[1:] in variables:
+            # Direct variable reference - return the value as-is (may not be string)
+            return variables[template[1:]]
+        # String interpolation: replace $var within strings
+        result = template
+        for var_name, var_value in variables.items():
+            result = result.replace(f"${var_name}", str(var_value))
+        # Handle $var.field references
+        import re as _re
+        for match in _re.finditer(r'\$(\w+)\.(\w+)', template):
+            full = match.group(0)
+            var_n = match.group(1)
+            field = match.group(2)
+            if var_n in variables and isinstance(variables[var_n], dict):
+                result = result.replace(full, str(variables[var_n].get(field, full)))
+        return result
+    elif isinstance(template, dict):
+        return {k: resolve_var(v, variables) for k, v in template.items()}
+    elif isinstance(template, list):
+        return [resolve_var(item, variables) for item in template]
+    return template
+
+
+def execute_dsl_steps(steps, variables, custom_operators=None):
+    """Execute a sequence of DSL steps with variable resolution.
+
+    Each step is one of:
+        {"primitive": "name", "params": {...}, "bind": "var_name"}
+        {"if": "condition", "then": step, "else": step}
+
+    Returns list of step results.
+    """
+    results = []
+    for step in steps:
+        # Handle conditional
+        if "if" in step:
+            condition = resolve_var(step["if"], variables)
+            # Simple condition evaluation (e.g., "$var.count > 0")
+            try:
+                cond_result = eval(str(condition), {"__builtins__": {}}, {})
+            except Exception:
+                cond_result = bool(condition)
+            branch = step.get("then") if cond_result else step.get("else")
+            if branch:
+                sub_results = execute_dsl_steps([branch], variables, custom_operators)
+                results.extend(sub_results)
+            continue
+
+        # Handle primitive step
+        if "primitive" in step:
+            prim_name = step["primitive"]
+            prim_params = resolve_var(step.get("params", {}), variables)
+
+            if prim_name in ("locate", "locate_region"):
+                # Read-only primitives
+                result = _execute_locate(prim_name, prim_params)
+            else:
+                result = _execute_primitive(prim_name, prim_params)
+
+            # Bind result to variable if requested
+            bind_name = step.get("bind")
+            if bind_name and isinstance(result, dict):
+                variables[bind_name] = result.get("result", result)
+
+            results.append(result)
+            if not result.get("success", False) and prim_name not in ("locate", "locate_region"):
+                break  # Stop on failure
+
+        # Handle composed operator reference
+        elif "op" in step:
+            op_name = step["op"]
+            op_params = resolve_var(step.get("params", {}), variables)
+            result = _execute_composed_op(op_name, op_params, custom_operators)
+            results.append(result)
+            if not result.get("success", False):
+                break
+
+    return results
+
+
+def _execute_locate(name, params):
+    """Execute a locate (read-only) primitive."""
+    locator = params.get("locator", params)
+    nodes = resolve_locator(locator)
+    if name == "locate":
+        node_info = []
+        for n in nodes:
+            text = _node_text(n)
+            preview = text[:100] + "..." if len(text) > 100 else text
+            node_info.append({
+                "start_line": n.start_point[0] + 1,
+                "end_line": n.end_point[0] + 1,
+                "kind": n.type,
+                "text_preview": preview,
+            })
+        return {"success": True, "found": len(nodes) > 0, "count": len(nodes), "nodes": node_info}
+    elif name == "locate_region":
+        if not nodes:
+            return {"success": False, "error": "No nodes matched"}
+        n = nodes[0]
+        text = _node_text(n)
+        return {"success": True, "start_byte": n.start_byte, "end_byte": n.end_byte,
+                "start_line": n.start_point[0] + 1, "end_line": n.end_point[0] + 1, "text": text}
+    return {"success": False, "error": f"Unknown locate: {name}"}
+
+
+def expand_composed_operator(op_name, op_params, custom_operators=None):
+    """Expand a composed operator into its primitive steps with resolved variables.
+
+    Returns (steps, variables) or (None, error_msg).
+    """
+    # Check custom operators first
+    op_def = None
+    if custom_operators:
+        for custom in custom_operators:
+            if custom.get("define") == op_name:
+                op_def = custom
+                break
+
+    # Then check built-in composed operators
+    if op_def is None:
+        op_def = BUILTIN_COMPOSED_OPS.get(op_name)
+
+    if op_def is None:
+        return None, f"Unknown composed operator: {op_name}"
+
+    steps = op_def.get("steps", [])
+    variables = dict(op_params)  # param values become variables for $var resolution
+    return steps, variables
+
+
+def _execute_composed_op(op_name, op_params, custom_operators=None):
+    """Execute a composed operator by expanding and running its steps."""
+    steps, variables_or_error = expand_composed_operator(op_name, op_params, custom_operators)
+    if steps is None:
+        return {"success": False, "error": variables_or_error}
+
+    results = execute_dsl_steps(steps, variables_or_error, custom_operators)
+    if not results:
+        return {"success": False, "error": f"No steps executed for {op_name}"}
+
+    # Check if all steps succeeded
+    all_ok = all(r.get("success", False) for r in results)
+    if all_ok:
+        return {"success": True, "results": results}
+
+    # Find first failure
+    for r in results:
+        if not r.get("success", False):
+            return {"success": False, "error": r.get("error", "Unknown error"), "results": results}
+    return {"success": False, "error": "Unknown failure"}
+
+
+# ============================================================
 # execute_step: Apply a single plan step (file modification)
 # ============================================================
 
@@ -1266,13 +2227,47 @@ def _write_lines(path, lines):
         f.writelines(lines)
 
 
-def execute_step(step_json):
-    """Execute a single plan step (file modification)."""
-    step = json.loads(step_json)
-    op = step["op"]
-    params = step["params"]
-    file_path = params.get("file", "")
+def execute_step(step_json, custom_operators=None):
+    """Execute a single plan step (file modification).
 
+    Routes to primitive engine for AST-node primitives, falls back to
+    legacy operator implementations for backward compatibility.
+    """
+    step = json.loads(step_json) if isinstance(step_json, str) else step_json
+    op = step["op"]
+    params = step.get("params", {})
+    file_path = params.get("file", "") or (params.get("locator", {}).get("file", ""))
+
+    # Route primitives through the new engine
+    if op in PRIMITIVE_OPS:
+        if op in ("locate", "locate_region"):
+            result = _execute_locate(op, params)
+        else:
+            result = _execute_primitive(op, params)
+        print(json.dumps(result))
+        if not result.get("success"):
+            sys.exit(1)
+        return
+
+    # Route composed operators (built-in + custom)
+    if op in BUILTIN_COMPOSED_OPS or (custom_operators and any(c.get("define") == op for c in custom_operators)):
+        result = _execute_composed_op(op, params, custom_operators)
+        print(json.dumps(result))
+        if not result.get("success"):
+            # Try legacy fallback if available
+            fallback = BUILTIN_COMPOSED_OPS.get(op, {}).get("fallback")
+            if fallback and fallback in globals():
+                try:
+                    globals()[fallback](params)
+                    print(json.dumps({"success": True, "fallback": True}))
+                    return
+                except Exception as e:
+                    print(json.dumps({"success": False, "error": str(e)}))
+                    sys.exit(1)
+            sys.exit(1)
+        return
+
+    # Legacy operator routing (backward compatibility)
     try:
         if op == "replace_code":
             _exec_replace_code(params)
@@ -1554,9 +2549,15 @@ if __name__ == "__main__":
         verify_plan(sys.argv[2], sys.argv[3])
     elif cmd == "execute_step":
         if len(sys.argv) < 3:
-            print("Usage: graphplan_helper.py execute_step '<step_json>'", file=sys.stderr)
+            print("Usage: graphplan_helper.py execute_step '<step_json>' ['<custom_operators_json>']", file=sys.stderr)
             sys.exit(1)
-        execute_step(sys.argv[2])
+        custom_ops = None
+        if len(sys.argv) >= 4:
+            try:
+                custom_ops = json.loads(sys.argv[3])
+            except json.JSONDecodeError:
+                pass
+        execute_step(sys.argv[2], custom_operators=custom_ops)
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)

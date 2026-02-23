@@ -27,31 +27,64 @@ _console = Console(highlight=False)
 
 OPERATOR_CATALOG_PROMPT = """## Available Edit Operators
 
-### Tier 1 (Essential - use these first):
-  `replace_code(file, pattern, replacement)` - Replace a code pattern with new code
-    Example: {"op": "replace_code", "params": {"file": "query.py", "pattern": "if self.deferred:", "replacement": "if self.deferred and not self._select:"}}
-  `insert_code(file, anchor_line, position, code)` - Insert code before or after a specific line
-    Example: {"op": "insert_code", "params": {"file": "query.py", "anchor_line": 847, "position": "after", "code": "    self._clear_cache()"}}
-  `delete_lines(file, start_line, end_line)` - Delete lines from start_line to end_line (inclusive)
-    Example: {"op": "delete_lines", "params": {"file": "query.py", "start_line": 50, "end_line": 53}}
-  `add_method(file, class_name, method_code)` - Add a new method to an existing class
-    Example: {"op": "add_method", "params": {"file": "query.py", "class_name": "QuerySet", "method_code": "    def _clear_cache(self):\\n        self._cache = {}"}}
-  `add_import(file, import_statement)` - Add an import statement to the top of a file
-    Example: {"op": "add_import", "params": {"file": "query.py", "import_statement": "from collections import OrderedDict"}}
-  `modify_function_signature(file, func_name, old_signature, new_signature)` - Change a function's parameter list
-    Example: {"op": "modify_function_signature", "params": {"file": "query.py", "func_name": "defer", "old_signature": "def defer(self, *fields)", "new_signature": "def defer(self, *fields, clear_cache=True)"}}
+You can use **AST-node primitives** (preferred) or **legacy operators** (backward compatible).
 
-### Tier 2 (Structural - for complex multi-step fixes):
-  `rename_symbol(file, old_name, new_name)` - Rename a variable/function/class and update all references in scope
-    Example: {"op": "rename_symbol", "params": {"file": "query.py", "old_name": "_deferred", "new_name": "_deferred_fields"}}
-  `wrap_block(file, start_line, end_line, before_code, after_code)` - Wrap lines in a block structure (try/except, if/else, etc.)
-    Example: {"op": "wrap_block", "params": {"file": "query.py", "start_line": 50, "end_line": 55, "before_code": "    try:", "after_code": "    except ValueError:\\n        pass"}}
-  `add_class_attribute(file, class_name, attribute_code)` - Add a class-level attribute
-    Example: {"op": "add_class_attribute", "params": {"file": "query.py", "class_name": "QuerySet", "attribute_code": "    _deferred_cache = None"}}
-  `replace_function_body(file, func_name, new_body)` - Replace the entire body of a function
-    Example: {"op": "replace_function_body", "params": {"file": "query.py", "func_name": "_clear_cache", "new_body": "        self._cache = {}\\n        self._result_cache = None"}}
+### AST-Node Primitives (Preferred)
 
-Output your plan as JSON: [{"op": "name", "params": {...}}, ...]"""
+Primitives use **locators** to find targets structurally via tree-sitter. A locator is a JSON object:
+```json
+{"kind": "function", "name": "defer", "file": "query.py", "parent": {"kind": "class", "name": "QuerySet"}}
+```
+
+Locator fields:
+- `kind`: normalized AST kind: `function`, `class`, `method`, `import`, `statement`, `interface`, `enum`
+- `name`: symbol name (for named nodes)
+- `file`: file path
+- `parent`: nested locator to search within children of parent
+- `field`: tree-sitter field of matched node (`body`, `parameters`, `condition`)
+- `nth_child`: select Nth child (-1 for last)
+- `index`: disambiguate when multiple matches (0-based)
+
+**Mutator primitives:**
+  `replace_node` - Replace a node's text: `{"op": "replace_node", "params": {"locator": {...}, "replacement": "new code"}}`
+  `insert_before_node` - Insert code before a node: `{"op": "insert_before_node", "params": {"locator": {...}, "code": "new code"}}`
+  `insert_after_node` - Insert code after a node: `{"op": "insert_after_node", "params": {"locator": {...}, "code": "new code"}}`
+  `delete_node` - Delete a node: `{"op": "delete_node", "params": {"locator": {...}}}`
+  `wrap_node` - Wrap a node: `{"op": "wrap_node", "params": {"locator": {...}, "before": "try:", "after": "except: pass"}}`
+  `replace_all_matching` - Replace all matches: `{"op": "replace_all_matching", "params": {"locator": {...}, "replacement": "new", "filter": "not_in_string_or_comment"}}`
+
+**Read-only primitives:**
+  `locate` - Find nodes: `{"op": "locate", "params": {"locator": {...}}}`
+  `locate_region` - Get node text/range: `{"op": "locate_region", "params": {"locator": {...}}}`
+
+### Built-in Composed Operators
+  `add_method(file, class_name, method_code)` - Add a method to a class
+  `add_import(file, import_statement)` - Add an import statement
+  `add_class_attribute(file, class_name, attribute_code)` - Add a class attribute
+
+### Custom Operators (define_operators)
+You can define reusable operators for the current plan:
+```json
+{"define_operators": [
+    {"define": "my_op", "params_schema": {"file": "string", "name": "string"},
+     "steps": [{"primitive": "insert_after_node", "params": {"locator": {"kind": "function", "name": "$name", "file": "$file"}, "code": "..."}}]}
+  ],
+  "plan": [{"op": "my_op", "params": {"file": "query.py", "name": "defer"}}]
+}
+```
+
+### Legacy Operators (still supported)
+  `replace_code(file, pattern, replacement)` - Replace text pattern
+  `insert_code(file, anchor_line, position, code)` - Insert at line number
+  `delete_lines(file, start_line, end_line)` - Delete line range
+  `modify_function_signature(file, func_name, old_signature, new_signature)` - Change signature
+  `rename_symbol(file, old_name, new_name)` - Rename symbol
+  `wrap_block(file, start_line, end_line, before_code, after_code)` - Wrap lines
+  `replace_function_body(file, func_name, new_body)` - Replace function body
+
+Output your plan as JSON. Use either:
+- Simple: `[{"op": "name", "params": {...}}, ...]`
+- With custom operators: `{"define_operators": [...], "plan": [...]}`"""
 
 READY_TO_PLAN_PATTERN = re.compile(r"READY_TO_PLAN:\s*\[([^\]]*)\]", re.DOTALL)
 PLAN_JSON_PATTERN = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)
@@ -425,8 +458,19 @@ class GraphPlanAgent(DefaultAgent):
         return "[]"
 
     @staticmethod
-    def _is_valid_plan(plan: list) -> bool:
-        """Check that a parsed JSON array looks like a plan (list of op dicts)."""
+    def _is_valid_plan(plan) -> bool:
+        """Check that parsed JSON looks like a plan.
+
+        Accepts:
+          - List of op dicts: [{"op": ..., "params": ...}, ...]
+          - Object with plan key: {"define_operators": [...], "plan": [...]}
+        """
+        if isinstance(plan, dict):
+            # Object format: {"define_operators": [...], "plan": [...]}
+            plan_steps = plan.get("plan", [])
+            if isinstance(plan_steps, list) and len(plan_steps) > 0:
+                return isinstance(plan_steps[0], dict) and "op" in plan_steps[0]
+            return False
         if not isinstance(plan, list) or len(plan) == 0:
             return False
         # At least the first element must be a dict with an "op" key
@@ -466,15 +510,29 @@ class GraphPlanAgent(DefaultAgent):
 
     @staticmethod
     def _extract_plan_json_from_text(text: str) -> str:
-        """Extract JSON plan array from raw text.
+        """Extract JSON plan from raw text.
 
-        Validates that the array contains plan step dicts (with "op" key)
-        to avoid accidentally picking up file lists or other JSON arrays.
+        Accepts both array format [{"op": ...}] and object format
+        {"define_operators": [...], "plan": [...]}.
+
+        Validates that the result contains plan step dicts (with "op" key)
+        to avoid accidentally picking up file lists or other JSON.
         """
-        # Try ```json [...] ``` first
+        # Try ```json ... ``` first (handles both array and object)
         match = PLAN_JSON_PATTERN.search(text)
         if match:
             candidate = match.group(1).strip()
+            try:
+                parsed = json.loads(candidate)
+                if GraphPlanAgent._is_valid_plan(parsed):
+                    return candidate
+            except json.JSONDecodeError:
+                pass
+
+        # Try object format with ```json {...} ```
+        obj_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if obj_match:
+            candidate = obj_match.group(1).strip()
             try:
                 parsed = json.loads(candidate)
                 if GraphPlanAgent._is_valid_plan(parsed):
@@ -487,6 +545,18 @@ class GraphPlanAgent(DefaultAgent):
         end = text.rfind("]")
         if start >= 0 and end > start:
             candidate = text[start:end + 1]
+            try:
+                parsed = json.loads(candidate)
+                if GraphPlanAgent._is_valid_plan(parsed):
+                    return candidate
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: find raw JSON object with "plan" key
+        obj_start = text.find("{")
+        obj_end = text.rfind("}")
+        if obj_start >= 0 and obj_end > obj_start:
+            candidate = text[obj_start:obj_end + 1]
             try:
                 parsed = json.loads(candidate)
                 if GraphPlanAgent._is_valid_plan(parsed):
@@ -519,19 +589,34 @@ class GraphPlanAgent(DefaultAgent):
     def _execute_plan(self, plan_json: str) -> tuple[bool, list[str]]:
         """Execute each step of the plan. Returns (all_succeeded, errors)."""
         try:
-            steps = json.loads(plan_json)
+            plan_data = json.loads(plan_json)
         except json.JSONDecodeError:
             return False, ["Invalid plan JSON"]
 
+        # Extract steps and custom operators from both formats
+        if isinstance(plan_data, dict):
+            steps = plan_data.get("plan", [])
+            custom_operators = plan_data.get("define_operators", [])
+        elif isinstance(plan_data, list):
+            steps = plan_data
+            custom_operators = []
+        else:
+            return False, ["Invalid plan format"]
+
         errors = []
+        custom_ops_json = shlex.quote(json.dumps(custom_operators)) if custom_operators else ""
+
         for i, step in enumerate(steps):
             op = step.get("op", "?")
             target = step.get("params", {}).get("file", "?")
+            if target == "?":
+                target = step.get("params", {}).get("locator", {}).get("file", "?")
             _console.print(f"  [{i+1}/{len(steps)}] [cyan]{op}[/cyan] on [bold]{target}[/bold]", highlight=False)
             step_json = shlex.quote(json.dumps(step))
-            result = self.env.execute({
-                "command": f"python3 /tmp/graphplan_helper.py execute_step {step_json}"
-            })
+            cmd = f"python3 /tmp/graphplan_helper.py execute_step {step_json}"
+            if custom_ops_json:
+                cmd += f" {custom_ops_json}"
+            result = self.env.execute({"command": cmd})
             if result.get("returncode", -1) != 0:
                 error_msg = f"Step {i} ({op}) failed: {result.get('output', '')[:200]}"
                 errors.append(error_msg)
