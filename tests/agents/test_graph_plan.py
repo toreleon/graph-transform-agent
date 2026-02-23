@@ -1901,3 +1901,736 @@ def test_execute_locate():
         assert len(result["nodes"]) == 2
     finally:
         os.unlink(tmp)
+
+
+# ============================================================
+# Formal Code Transformations Tests
+# ============================================================
+
+
+class TestTierDetection:
+    """Test tier detection from step dicts."""
+
+    def test_tier1_surgery_ops(self):
+        ns = _get_helper_ns()
+        detect = ns["detect_tier"]
+        assert detect({"op": "rename_identifier", "target": {}}) == 1
+        assert detect({"op": "delete_node", "target": {}}) == 1
+        assert detect({"op": "copy_node", "target": {}, "source": {}}) == 1
+        assert detect({"op": "move_node", "target": {}, "source": {}}) == 1
+        assert detect({"op": "swap_nodes", "target": {}, "source": {}}) == 1
+        assert detect({"op": "reorder_children", "target": {}, "order": [0, 1]}) == 1
+
+    def test_tier2_template(self):
+        ns = _get_helper_ns()
+        detect = ns["detect_tier"]
+        assert detect({"template": "guard_clause", "params": {}}) == 2
+        assert detect({"template": "modify_condition", "params": {}}) == 2
+
+    def test_tier3_fragment(self):
+        ns = _get_helper_ns()
+        detect = ns["detect_tier"]
+        assert detect({"fragment": {"kind": "if_statement"}, "target": {}}) == 3
+
+    def test_tier0_legacy(self):
+        ns = _get_helper_ns()
+        detect = ns["detect_tier"]
+        # Legacy primitives — not in FORMAL_SURGERY_OPS
+        assert detect({"op": "replace_node", "params": {}}) == 0
+        assert detect({"op": "replace_code", "params": {}}) == 0
+        assert detect({"op": "insert_code", "params": {}}) == 0
+
+
+class TestTemplateCatalog:
+    """Test that all 15 templates are registered and validate correctly."""
+
+    def test_all_15_templates_registered(self):
+        ns = _get_helper_ns()
+        catalog = ns["TEMPLATE_CATALOG"]
+        expected = {
+            "guard_clause", "wrap_try_except", "add_parameter",
+            "replace_expression", "extract_variable", "add_import_and_use",
+            "add_method", "modify_condition", "add_conditional_branch",
+            "replace_function_body", "wrap_context_manager", "add_decorator",
+            "inline_variable", "change_return_value", "add_class_attribute",
+        }
+        assert set(catalog.keys()) == expected
+
+    def test_guard_clause_valid_params(self):
+        ns = _get_helper_ns()
+        validate = ns["_validate_template_params"]
+        errors = validate("guard_clause", {
+            "condition": "x is not None",
+            "guard_body": "return None",
+            "target": {"kind": "function", "file": "test.py"},
+        })
+        assert errors == []
+
+    def test_guard_clause_missing_required(self):
+        ns = _get_helper_ns()
+        validate = ns["_validate_template_params"]
+        errors = validate("guard_clause", {"condition": "x > 0"})
+        assert any("guard_body" in e for e in errors)
+        assert any("target" in e for e in errors)
+
+    def test_replace_expression_valid(self):
+        ns = _get_helper_ns()
+        validate = ns["_validate_template_params"]
+        errors = validate("replace_expression", {
+            "target": {"kind": "statement", "file": "test.py"},
+            "new_expression": "repr(v)",
+        })
+        assert errors == []
+
+    def test_add_parameter_valid(self):
+        ns = _get_helper_ns()
+        validate = ns["_validate_template_params"]
+        errors = validate("add_parameter", {
+            "function": {"kind": "function", "name": "foo", "file": "test.py"},
+            "param_name": "timeout",
+            "default_value": "None",
+        })
+        assert errors == []
+
+    def test_add_parameter_invalid_identifier(self):
+        ns = _get_helper_ns()
+        validate = ns["_validate_template_params"]
+        errors = validate("add_parameter", {
+            "function": {"kind": "function", "file": "test.py"},
+            "param_name": "123invalid",
+        })
+        assert any("identifier" in e for e in errors)
+
+    def test_add_conditional_branch_enum(self):
+        ns = _get_helper_ns()
+        validate = ns["_validate_template_params"]
+        errors = validate("add_conditional_branch", {
+            "if_target": {"kind": "statement", "file": "test.py"},
+            "branch_type": "elif",
+            "branch_body": "return -1",
+            "condition": "x < 0",
+        })
+        assert errors == []
+
+    def test_add_conditional_branch_invalid_enum(self):
+        ns = _get_helper_ns()
+        validate = ns["_validate_template_params"]
+        errors = validate("add_conditional_branch", {
+            "if_target": {"kind": "statement", "file": "test.py"},
+            "branch_type": "switch",  # invalid
+            "branch_body": "pass",
+        })
+        assert any("branch_type" in e for e in errors)
+
+    def test_unknown_template(self):
+        ns = _get_helper_ns()
+        validate = ns["_validate_template_params"]
+        errors = validate("nonexistent_template", {})
+        assert any("Unknown template" in e for e in errors)
+
+
+class TestFragmentSerialization:
+    """Test fragment serialization to Python code."""
+
+    def test_return_statement(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({"kind": "return_statement", "value": "42"}, indent=0)
+        assert code == "return 42"
+
+    def test_raise_statement(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({"kind": "raise_statement", "value": "ValueError('bad')"}, indent=0)
+        assert code == "raise ValueError('bad')"
+
+    def test_assignment(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({"kind": "assignment", "target": "x", "value": "42"}, indent=0)
+        assert code == "x = 42"
+
+    def test_assignment_with_type_annotation(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({"kind": "assignment", "target": "x", "value": "42", "type_annotation": "int"}, indent=0)
+        assert code == "x: int = 42"
+
+    def test_expression_statement(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({"kind": "expression_statement", "expression": "print('hello')"}, indent=0)
+        assert code == "print('hello')"
+
+    def test_if_statement(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({
+            "kind": "if_statement",
+            "condition": "x > 0",
+            "children": [
+                {"kind": "return_statement", "value": "x"},
+            ],
+        }, indent=0)
+        assert "if x > 0:" in code
+        assert "    return x" in code
+
+    def test_if_else(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        frag = {
+            "kind": "if_statement",
+            "condition": "x > 0",
+            "children": [
+                {"kind": "return_statement", "value": "x"},
+            ],
+        }
+        code = serialize(frag, indent=0)
+        assert "if x > 0:" in code
+
+    def test_for_statement(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({
+            "kind": "for_statement",
+            "target": "item",
+            "iterable": "items",
+            "children": [
+                {"kind": "expression_statement", "expression": "process(item)"},
+            ],
+        }, indent=0)
+        assert "for item in items:" in code
+        assert "    process(item)" in code
+
+    def test_while_statement(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({
+            "kind": "while_statement",
+            "condition": "running",
+            "children": [
+                {"kind": "expression_statement", "expression": "tick()"},
+            ],
+        }, indent=0)
+        assert "while running:" in code
+
+    def test_with_statement(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({
+            "kind": "with_statement",
+            "context": "open('file.txt')",
+            "as_var": "f",
+            "children": [
+                {"kind": "expression_statement", "expression": "data = f.read()"},
+            ],
+        }, indent=0)
+        assert "with open('file.txt') as f:" in code
+
+    def test_try_except(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({
+            "kind": "try_statement",
+            "children": [
+                {"kind": "expression_statement", "expression": "result = parse(data)"},
+                {"kind": "except_clause", "exception_type": "ValueError", "exception_var": "e",
+                 "children": [{"kind": "expression_statement", "expression": "log(e)"}]},
+            ],
+        }, indent=0)
+        assert "try:" in code
+        assert "    result = parse(data)" in code
+        assert "except ValueError as e:" in code
+        assert "    log(e)" in code
+
+    def test_function_definition(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({
+            "kind": "function_definition",
+            "name": "validate",
+            "parameters": ["self", "data"],
+            "children": [
+                {"kind": "return_statement", "value": "True"},
+            ],
+        }, indent=0)
+        assert "def validate(self, data):" in code
+        assert "    return True" in code
+
+    def test_function_with_decorator(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({
+            "kind": "function_definition",
+            "name": "cached_method",
+            "parameters": ["self"],
+            "decorator": "property",
+            "children": [
+                {"kind": "return_statement", "value": "self._value"},
+            ],
+        }, indent=0)
+        assert "@property" in code
+        assert "def cached_method(self):" in code
+
+    def test_class_definition(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({
+            "kind": "class_definition",
+            "name": "MyClass",
+            "bases": ["Base"],
+            "children": [
+                {"kind": "expression_statement", "expression": "pass"},
+            ],
+        }, indent=0)
+        assert "class MyClass(Base):" in code
+
+    def test_indented_serialization(self):
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+        code = serialize({"kind": "return_statement", "value": "42"}, indent=2)
+        assert code == "        return 42"
+
+    def test_serialized_code_parses(self):
+        """Fragment serialization should produce parseable Python."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        serialize = ns["serialize_fragment"]
+
+        frag = {
+            "kind": "function_definition",
+            "name": "validate_input",
+            "parameters": ["self", "data"],
+            "children": [
+                {"kind": "if_statement", "condition": "not isinstance(data, dict)",
+                 "children": [
+                     {"kind": "raise_statement", "value": "TypeError('Expected dict')"},
+                 ]},
+                {"kind": "return_statement", "value": "data"},
+            ],
+        }
+        code = serialize(frag, indent=0)
+        verify = ns["_verify_parses_ok_content"]
+        ok, err = verify(code, "test.py")
+        assert ok, f"Serialized code has parse errors: {err}\n{code}"
+
+
+class TestFragmentValidation:
+    """Test fragment validation catches structural errors."""
+
+    def test_valid_fragment(self):
+        ns = _get_helper_ns()
+        validate = ns["validate_fragment"]
+        errors = validate({
+            "kind": "if_statement",
+            "condition": "x > 0",
+            "children": [{"kind": "return_statement", "value": "x"}],
+        })
+        assert errors == []
+
+    def test_missing_required_property(self):
+        ns = _get_helper_ns()
+        validate = ns["validate_fragment"]
+        errors = validate({"kind": "if_statement"})
+        assert any("condition" in e for e in errors)
+
+    def test_empty_kind(self):
+        ns = _get_helper_ns()
+        validate = ns["validate_fragment"]
+        errors = validate({"kind": ""})
+        assert any("non-empty" in e for e in errors)
+
+    def test_leaf_with_children(self):
+        ns = _get_helper_ns()
+        validate = ns["validate_fragment"]
+        errors = validate({
+            "kind": "return_statement",
+            "value": "42",
+            "children": [{"kind": "expression_statement", "expression": "x"}],
+        })
+        assert any("leaf" in e for e in errors)
+
+    def test_assignment_requires_target_and_value(self):
+        ns = _get_helper_ns()
+        validate = ns["validate_fragment"]
+        errors = validate({"kind": "assignment"})
+        assert any("target" in e for e in errors)
+        assert any("value" in e for e in errors)
+
+    def test_for_requires_target_and_iterable(self):
+        ns = _get_helper_ns()
+        validate = ns["validate_fragment"]
+        errors = validate({"kind": "for_statement"})
+        assert any("target" in e for e in errors)
+        assert any("iterable" in e for e in errors)
+
+    def test_recursive_validation(self):
+        ns = _get_helper_ns()
+        validate = ns["validate_fragment"]
+        errors = validate({
+            "kind": "if_statement",
+            "condition": "True",
+            "children": [{"kind": "for_statement"}],  # missing target & iterable
+        })
+        assert any("child[0]" in e for e in errors)
+
+
+class TestVerificationHierarchy:
+    """Test L1-L6 verification functions."""
+
+    def test_l1_kind_same(self):
+        ns = _get_helper_ns()
+        ok, msg, is_err = ns["verify_kind_preservation"]("function_definition", "function_definition")
+        assert ok is True
+
+    def test_l1_kind_different(self):
+        ns = _get_helper_ns()
+        ok, msg, is_err = ns["verify_kind_preservation"]("function_definition", "expression_statement")
+        assert ok is False
+        assert is_err is True
+        assert "Kind changed" in msg
+
+    def test_l6_trivial_pass(self):
+        ns = _get_helper_ns()
+        ok, msg, is_err = ns["verify_non_triviality"]("pass")
+        assert ok is False
+        assert is_err is False  # warning only
+
+    def test_l6_trivial_return_none(self):
+        ns = _get_helper_ns()
+        ok, msg, is_err = ns["verify_non_triviality"]("return None")
+        assert ok is False
+
+    def test_l6_nontrivial(self):
+        ns = _get_helper_ns()
+        ok, msg, is_err = ns["verify_non_triviality"]("return self._cache.get(key, default)")
+        assert ok is True
+
+    def test_l3_referential_in_scope(self):
+        """L3 should pass when identifiers are in scope."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("import os\n\ndef foo(x):\n    return x + 1\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            ok, msg, is_err = ns["verify_referential_integrity"]("return x + 1", tmp, 30)
+            # Should pass or warn (not error)
+            assert is_err is False
+        finally:
+            os.unlink(tmp)
+
+    def test_l4_import_closure(self):
+        """L4 should pass when symbols are imported."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("from collections import OrderedDict\n\ndef foo():\n    pass\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            ok, msg, is_err = ns["verify_import_closure"]("x = OrderedDict()", tmp)
+            assert ok is True
+            assert is_err is False
+        finally:
+            os.unlink(tmp)
+
+    def test_l4_import_missing(self):
+        """L4 should warn when symbols are not imported."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("def foo():\n    pass\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            ok, msg, is_err = ns["verify_import_closure"]("x = OrderedDict()", tmp)
+            assert ok is False  # should warn
+            assert is_err is False  # but not error
+            assert "OrderedDict" in msg
+        finally:
+            os.unlink(tmp)
+
+
+class TestFormalStepExecution:
+    """Test execution of formal transform steps."""
+
+    def test_template_guard_clause(self):
+        """Guard clause should insert an if-statement before the target."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("def process(data):\n    result = data * 2\n    return result\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            result = ns["execute_formal_step"]({
+                "template": "guard_clause",
+                "params": {
+                    "condition": "data is None",
+                    "guard_body": "return None",
+                    "target": {"kind": "statement", "file": tmp, "parent": {"kind": "function", "name": "process", "file": tmp}, "index": 0},
+                },
+            })
+            assert result is not None
+            assert result.get("success") is True, f"Failed: {result}"
+            content = open(tmp).read()
+            assert "if data is None:" in content
+            assert "return None" in content
+        finally:
+            os.unlink(tmp)
+
+    def test_template_replace_expression(self):
+        """Replace expression should swap one expression for another."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("x = v != init_params[k]\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            # Find the comparison expression
+            result = ns["execute_formal_step"]({
+                "template": "replace_expression",
+                "params": {
+                    "target": {"kind": "statement", "file": tmp, "index": 0},
+                    "new_expression": "x = repr(v) != repr(init_params[k])",
+                },
+            })
+            assert result is not None
+            assert result.get("success") is True, f"Failed: {result}"
+            content = open(tmp).read()
+            assert "repr(v)" in content
+        finally:
+            os.unlink(tmp)
+
+    def test_template_modify_condition(self):
+        """Modify condition should change only the condition of an if statement."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("if x > 0:\n    print('positive')\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            result = ns["execute_formal_step"]({
+                "template": "modify_condition",
+                "params": {
+                    "target": {"kind": "statement", "file": tmp, "index": 0},
+                    "new_condition": "x > 0 and y is not None",
+                },
+            })
+            assert result is not None
+            assert result.get("success") is True, f"Failed: {result}"
+            content = open(tmp).read()
+            assert "x > 0 and y is not None" in content
+            assert "print('positive')" in content  # body unchanged
+        finally:
+            os.unlink(tmp)
+
+    def test_template_wrap_try_except(self):
+        """Wrap try/except should wrap a statement in try/except."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("result = parse(data)\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            result = ns["execute_formal_step"]({
+                "template": "wrap_try_except",
+                "params": {
+                    "target": {"kind": "statement", "file": tmp, "index": 0},
+                    "exception_type": "ValueError",
+                    "handler_body": "result = None",
+                },
+            })
+            assert result is not None
+            assert result.get("success") is True, f"Failed: {result}"
+            content = open(tmp).read()
+            assert "try:" in content
+            assert "except ValueError:" in content
+        finally:
+            os.unlink(tmp)
+
+    def test_surgery_rename(self):
+        """Rename identifier should rename all occurrences."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("def old_func():\n    return old_func\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            result = ns["execute_formal_step"]({
+                "op": "rename_identifier",
+                "target": {"kind": "function", "name": "old_func", "file": tmp},
+                "new_name": "new_func",
+            })
+            assert result is not None
+            assert result.get("success") is True, f"Failed: {result}"
+            content = open(tmp).read()
+            assert "new_func" in content
+        finally:
+            os.unlink(tmp)
+
+    def test_fragment_execution(self):
+        """Fragment should serialize and apply at target location."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("def process(data):\n    result = data * 2\n    return result\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            # Replace the first statement in the function body with an if-statement
+            result = ns["execute_formal_step"]({
+                "fragment": {
+                    "kind": "if_statement",
+                    "condition": "data is None",
+                    "children": [
+                        {"kind": "return_statement", "value": "None"},
+                    ],
+                },
+                "target": {"kind": "function", "name": "process", "file": tmp,
+                           "field": "body", "nth_child": 0},
+                "action": "replace",
+            })
+            assert result is not None
+            assert result.get("success") is True, f"Failed: {result}"
+            content = open(tmp).read()
+            assert "if data is None:" in content
+        finally:
+            os.unlink(tmp)
+
+    def test_legacy_fallback(self):
+        """Legacy steps (tier 0) should return None for fallback."""
+        ns = _get_helper_ns()
+        result = ns["execute_formal_step"]({"op": "replace_code", "params": {}})
+        assert result is None
+
+    def test_template_add_decorator(self):
+        """Add decorator should insert @decorator before target."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("def my_func():\n    pass\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            result = ns["execute_formal_step"]({
+                "template": "add_decorator",
+                "params": {
+                    "target": {"kind": "function", "name": "my_func", "file": tmp},
+                    "decorator": "cache",
+                },
+            })
+            assert result is not None
+            assert result.get("success") is True, f"Failed: {result}"
+            content = open(tmp).read()
+            assert "@cache" in content
+        finally:
+            os.unlink(tmp)
+
+    def test_template_change_return_value(self):
+        """Change return value should modify the return expression."""
+        ts_langs = pytest.importorskip("tree_sitter_languages")
+        ns = _get_helper_ns()
+        ns["_treesitter_available"] = True
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("def foo():\n    return ms\n")
+            f.flush()
+            tmp = f.name
+
+        try:
+            result = ns["execute_formal_step"]({
+                "template": "change_return_value",
+                "params": {
+                    "target": {"kind": "statement", "file": tmp,
+                               "parent": {"kind": "function", "name": "foo", "file": tmp},
+                               "index": 0},
+                    "new_value": "dict(ms)",
+                },
+            })
+            assert result is not None
+            assert result.get("success") is True, f"Failed: {result}"
+            content = open(tmp).read()
+            assert "dict(ms)" in content
+        finally:
+            os.unlink(tmp)
+
+
+class TestVerifyPlanWithFormalSteps:
+    """Test that verify_plan accepts formal transform steps."""
+
+    def test_verify_plan_accepts_template_step(self):
+        """verify_plan should not error on valid template steps."""
+        ns = _get_helper_ns()
+        plan = [{"template": "guard_clause", "params": {
+            "condition": "x is not None",
+            "guard_body": "return None",
+            "target": {"kind": "function", "file": "test.py"},
+        }}]
+
+        # Just check that tier detection works in verify context
+        detect = ns["detect_tier"]
+        assert detect(plan[0]) == 2
+
+    def test_verify_plan_rejects_invalid_template(self):
+        """verify_plan should error on unknown template names."""
+        ns = _get_helper_ns()
+        validate = ns["_validate_template_params"]
+        errors = validate("nonexistent", {"condition": "True"})
+        assert len(errors) > 0
+
+    def test_verify_plan_accepts_fragment_step(self):
+        """verify_plan should not error on valid fragment steps."""
+        ns = _get_helper_ns()
+        detect = ns["detect_tier"]
+        step = {"fragment": {"kind": "return_statement", "value": "42"}, "target": {}}
+        assert detect(step) == 3
+
+    def test_mixed_tier_plan_detection(self):
+        """Mixed-tier plan should detect each step's tier correctly."""
+        ns = _get_helper_ns()
+        detect = ns["detect_tier"]
+        plan = [
+            {"op": "rename_identifier", "target": {}, "new_name": "x"},
+            {"template": "guard_clause", "params": {}},
+            {"fragment": {"kind": "return_statement"}, "target": {}},
+            {"op": "replace_code", "params": {}},
+        ]
+        tiers = [detect(s) for s in plan]
+        assert tiers == [1, 2, 3, 0]

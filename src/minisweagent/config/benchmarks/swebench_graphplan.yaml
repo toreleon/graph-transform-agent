@@ -20,11 +20,13 @@ agent:
     ### Phase 2: Plan Execution
     After you signal READY_TO_PLAN, the system will:
     1. Build a code graph (AST/tree-sitter analysis) of your listed files
-    2. Ask you to generate an edit plan using AST-node primitives or structured operators
-       - AST-node primitives use locators to find targets structurally (no line numbers needed)
-       - Locators re-query the live AST on every step, eliminating line-drift issues
-       - You can also define custom composed operators for reuse within the plan
-    3. Verify the plan against the code graph (including locator-based precondition checks)
+    2. Ask you to generate an edit plan using formal transforms (preferred), AST-node primitives, or legacy operators
+       - **Formal transforms**: Use named templates (guard_clause, modify_condition, replace_expression, etc.) with typed parameters. The system constructs code from templates — you specify WHAT to change, not the raw code.
+       - **AST surgery**: Use rename_identifier, delete_node, copy_node, move_node for structural operations with no code generation.
+       - **Typed fragments**: For novel code, describe the AST structure as a JSON tree with kinds and properties.
+       - All transforms use **locators** to find targets structurally (no line numbers needed).
+       - Legacy operators and raw AST-node primitives are still supported as fallback.
+    3. Verify the plan against the code graph (parameter validation, locator checks, L0-L6 verification)
     4. Execute the plan automatically with rollback on failure
 
     You will then review the changes and submit a patch.

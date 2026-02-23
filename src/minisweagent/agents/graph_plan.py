@@ -27,64 +27,84 @@ _console = Console(highlight=False)
 
 OPERATOR_CATALOG_PROMPT = """## Available Edit Operators
 
-You can use **AST-node primitives** (preferred) or **legacy operators** (backward compatible).
+Use **formal transforms** (preferred), **AST-node primitives**, or **legacy operators** (backward compatible).
 
-### AST-Node Primitives (Preferred)
-
-Primitives use **locators** to find targets structurally via tree-sitter. A locator is a JSON object:
+All locator-based operators use **locators** to find targets structurally via tree-sitter:
 ```json
 {"kind": "function", "name": "defer", "file": "query.py", "parent": {"kind": "class", "name": "QuerySet"}}
 ```
+Locator fields: `kind` (function/class/method/import/statement), `name`, `file`, `parent` (nested), `field` (body/parameters/condition), `nth_child`, `index`
 
-Locator fields:
-- `kind`: normalized AST kind: `function`, `class`, `method`, `import`, `statement`, `interface`, `enum`
-- `name`: symbol name (for named nodes)
-- `file`: file path
-- `parent`: nested locator to search within children of parent
-- `field`: tree-sitter field of matched node (`body`, `parameters`, `condition`)
-- `nth_child`: select Nth child (-1 for last)
-- `index`: disambiguate when multiple matches (0-based)
+### Formal Transforms (Preferred)
 
-**Mutator primitives:**
-  `replace_node` - Replace a node's text: `{"op": "replace_node", "params": {"locator": {...}, "replacement": "new code"}}`
-  `insert_before_node` - Insert code before a node: `{"op": "insert_before_node", "params": {"locator": {...}, "code": "new code"}}`
-  `insert_after_node` - Insert code after a node: `{"op": "insert_after_node", "params": {"locator": {...}, "code": "new code"}}`
-  `delete_node` - Delete a node: `{"op": "delete_node", "params": {"locator": {...}}}`
-  `wrap_node` - Wrap a node: `{"op": "wrap_node", "params": {"locator": {...}, "before": "try:", "after": "except: pass"}}`
-  `replace_all_matching` - Replace all matches: `{"op": "replace_all_matching", "params": {"locator": {...}, "replacement": "new", "filter": "not_in_string_or_comment"}}`
+#### Adding Code
+- **guard_clause**: Add a safety check before code
+  `{"template": "guard_clause", "params": {"condition": "data is not None", "guard_body": "return None", "target": {locator}}}`
+- **add_import_and_use**: Import a symbol and use it
+  `{"template": "add_import_and_use", "params": {"module": "collections", "symbol": "OrderedDict", "usage_target": {locator}, "usage_expression": "OrderedDict()"}}`
+- **add_method**: Add a method to a class
+  `{"template": "add_method", "params": {"class_locator": {locator}, "method_name": "validate", "parameters": ["self", "data"], "body": "return True"}}`
+- **add_parameter**: Add parameter to function
+  `{"template": "add_parameter", "params": {"function": {locator}, "param_name": "timeout", "default_value": "None"}}`
+- **add_class_attribute**: Add attribute to class
+  `{"template": "add_class_attribute", "params": {"class_locator": {locator}, "attr_name": "__slots__", "attr_value": "()"}}`
+- **add_decorator**: Add @decorator to function/class
+  `{"template": "add_decorator", "params": {"target": {locator}, "decorator": "cache"}}`
+- **add_conditional_branch**: Add elif/else to if statement
+  `{"template": "add_conditional_branch", "params": {"if_target": {locator}, "branch_type": "elif", "condition": "x < 0", "branch_body": "return -1"}}`
 
-**Read-only primitives:**
-  `locate` - Find nodes: `{"op": "locate", "params": {"locator": {...}}}`
-  `locate_region` - Get node text/range: `{"op": "locate_region", "params": {"locator": {...}}}`
+#### Modifying Code
+- **replace_expression**: Change one expression to another
+  `{"template": "replace_expression", "params": {"target": {locator}, "new_expression": "repr(v) != repr(init_params[k])"}}`
+- **modify_condition**: Change condition of if/while/for
+  `{"template": "modify_condition", "params": {"target": {locator}, "new_condition": "x > 0 and y is not None"}}`
+- **change_return_value**: Change what a function returns
+  `{"template": "change_return_value", "params": {"target": {locator}, "new_value": "dict(ms)"}}`
+- **replace_function_body**: Replace entire function body (use fragment)
+  `{"template": "replace_function_body", "params": {"function": {locator}, "new_body": {fragment}}}`
 
-### Built-in Composed Operators
-  `add_method(file, class_name, method_code)` - Add a method to a class
-  `add_import(file, import_statement)` - Add an import statement
-  `add_class_attribute(file, class_name, attribute_code)` - Add a class attribute
+#### Wrapping Code
+- **wrap_try_except**: Wrap in try/except
+  `{"template": "wrap_try_except", "params": {"target": {locator}, "exception_type": "ValueError", "handler_body": "return default"}}`
+- **wrap_context_manager**: Wrap in `with` statement
+  `{"template": "wrap_context_manager", "params": {"target": {locator}, "context_expr": "open(path)", "as_var": "f"}}`
 
-### Custom Operators (define_operators)
-You can define reusable operators for the current plan:
+#### Restructuring Code
+- **extract_variable**: Extract expression into named variable
+  `{"template": "extract_variable", "params": {"target": {locator}, "variable_name": "result"}}`
+- **inline_variable**: Replace variable with its value, remove assignment
+  `{"template": "inline_variable", "params": {"target": {locator}, "variable_name": "temp"}}`
+
+#### AST Surgery (no code generation)
+- **rename_identifier**: `{"op": "rename_identifier", "target": {locator}, "new_name": "new_func"}`
+- **delete_node**: `{"op": "delete_node", "target": {locator}}`
+- **copy_node**: `{"op": "copy_node", "target": {locator}, "source": {locator}}`
+- **move_node**: `{"op": "move_node", "target": {locator}, "source": {locator}}`
+- **swap_nodes**: `{"op": "swap_nodes", "target": {locator}, "source": {locator}}`
+
+#### Novel Code (typed fragments)
+When no template fits, describe AST structure:
 ```json
-{"define_operators": [
-    {"define": "my_op", "params_schema": {"file": "string", "name": "string"},
-     "steps": [{"primitive": "insert_after_node", "params": {"locator": {"kind": "function", "name": "$name", "file": "$file"}, "code": "..."}}]}
-  ],
-  "plan": [{"op": "my_op", "params": {"file": "query.py", "name": "defer"}}]
-}
+{"fragment": {"kind": "if_statement", "condition": "not isinstance(data, dict)",
+  "children": [{"kind": "raise_statement", "value": "TypeError('Expected dict')"}]},
+ "target": {locator}, "action": "replace"}
 ```
+Supported kinds: function_definition, class_definition, if_statement, elif_clause, else_clause, for_statement, while_statement, with_statement, try_statement, except_clause, finally_clause, return_statement, raise_statement, assignment, expression_statement
+
+### AST-Node Primitives
+  `replace_node` - `{"op": "replace_node", "params": {"locator": {...}, "replacement": "new code"}}`
+  `insert_before_node` / `insert_after_node` - `{"op": "...", "params": {"locator": {...}, "code": "new code"}}`
+  `delete_node` - `{"op": "delete_node", "params": {"locator": {...}}}`
+  `wrap_node` - `{"op": "wrap_node", "params": {"locator": {...}, "before": "try:", "after": "except: pass"}}`
+  `replace_all_matching` - `{"op": "replace_all_matching", "params": {"locator": {...}, "replacement": "new"}}`
 
 ### Legacy Operators (still supported)
-  `replace_code(file, pattern, replacement)` - Replace text pattern
-  `insert_code(file, anchor_line, position, code)` - Insert at line number
-  `delete_lines(file, start_line, end_line)` - Delete line range
-  `modify_function_signature(file, func_name, old_signature, new_signature)` - Change signature
-  `rename_symbol(file, old_name, new_name)` - Rename symbol
-  `wrap_block(file, start_line, end_line, before_code, after_code)` - Wrap lines
-  `replace_function_body(file, func_name, new_body)` - Replace function body
+  `replace_code(file, pattern, replacement)`, `insert_code(file, anchor_line, position, code)`,
+  `delete_lines(file, start_line, end_line)`, `rename_symbol(file, old_name, new_name)`,
+  `wrap_block(file, start_line, end_line, before_code, after_code)`,
+  `replace_function_body(file, func_name, new_body)`
 
-Output your plan as JSON. Use either:
-- Simple: `[{"op": "name", "params": {...}}, ...]`
-- With custom operators: `{"define_operators": [...], "plan": [...]}`"""
+Output your plan as JSON: `[{"template": "...", "params": {...}}, ...]` or with custom operators: `{"define_operators": [...], "plan": [...]}`"""
 
 READY_TO_PLAN_PATTERN = re.compile(r"READY_TO_PLAN:\s*\[([^\]]*)\]", re.DOTALL)
 PLAN_JSON_PATTERN = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)

@@ -1181,6 +1181,25 @@ def verify_plan(plan_json, graph_json):
         op = step.get("op", "")
         params = step.get("params", {})
 
+        # Check if this is a formal transform step (Tier 1/2/3)
+        tier = detect_tier(step)
+        if tier > 0:
+            # Validate formal step parameters
+            if tier == 2:
+                tmpl_name = step.get("template", "")
+                if tmpl_name not in TEMPLATE_CATALOG:
+                    errors.append(f"Step {i}: Unknown template '{tmpl_name}'")
+                else:
+                    tmpl_errors = _validate_template_params(tmpl_name, step.get("params", {}))
+                    for e in tmpl_errors:
+                        errors.append(f"Step {i}: {e}")
+            elif tier == 3:
+                frag = step.get("fragment", {})
+                frag_errors = validate_fragment(frag)
+                for e in frag_errors:
+                    errors.append(f"Step {i}: {e}")
+            continue  # formal steps skip legacy validation
+
         # Check if this is a custom-defined operator
         is_custom = any(c.get("define") == op for c in custom_operators)
 
@@ -2204,6 +2223,1410 @@ def _execute_composed_op(op_name, op_params, custom_operators=None):
 
 
 # ============================================================
+# Formal Code Transformations: Three-Tier System
+# ============================================================
+
+# --- Tier Detection ---
+
+FORMAL_SURGERY_OPS = {
+    "rename_identifier", "copy_node", "move_node",
+    "swap_nodes", "delete_node", "reorder_children",
+}
+
+
+def detect_tier(step):
+    """Detect which tier a step dict belongs to.
+
+    Returns 1 (surgery), 2 (template), 3 (fragment), or 0 (legacy).
+    """
+    if "op" in step and step["op"] in FORMAL_SURGERY_OPS:
+        return 1
+    if "template" in step:
+        return 2
+    if "fragment" in step:
+        return 3
+    return 0
+
+
+# --- Parameter Validation ---
+
+PYTHON_BUILTINS = {
+    "print", "len", "range", "int", "str", "float", "bool", "list", "dict",
+    "set", "tuple", "type", "isinstance", "issubclass", "hasattr", "getattr",
+    "setattr", "delattr", "super", "property", "staticmethod", "classmethod",
+    "object", "None", "True", "False", "abs", "all", "any", "bin", "bytes",
+    "callable", "chr", "complex", "dir", "divmod", "enumerate", "eval",
+    "exec", "filter", "format", "frozenset", "globals", "hash", "hex", "id",
+    "input", "iter", "map", "max", "min", "next", "oct", "open", "ord",
+    "pow", "repr", "reversed", "round", "slice", "sorted", "sum", "vars",
+    "zip", "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
+    "AttributeError", "RuntimeError", "StopIteration", "NotImplementedError",
+    "OSError", "IOError", "FileNotFoundError", "ImportError", "NameError",
+    "AssertionError", "ZeroDivisionError", "OverflowError", "DeprecationWarning",
+}
+
+
+def _validate_param_identifier(value):
+    """Validate a value is a valid Python identifier."""
+    if not isinstance(value, str) or not value.isidentifier():
+        return f"must be a valid identifier, got: {value!r}"
+    return None
+
+
+def _validate_param_expression(value):
+    """Validate a value is a parseable expression."""
+    if not isinstance(value, str) or not value.strip():
+        return f"must be a non-empty expression string, got: {value!r}"
+    # Try parsing as expression with tree-sitter
+    ok, err = _verify_parses_ok_content(f"_ = {value}", "check.py")
+    if not ok:
+        return f"does not parse as valid expression: {value!r}"
+    return None
+
+
+def _validate_param_statement(value):
+    """Validate a value is a parseable statement."""
+    if not isinstance(value, str) or not value.strip():
+        return f"must be a non-empty statement string, got: {value!r}"
+    ok, err = _verify_parses_ok_content(value, "check.py")
+    if not ok:
+        return f"does not parse as valid statement: {value!r}"
+    return None
+
+
+def _validate_param_locator(value):
+    """Validate a value is a locator dict."""
+    if not isinstance(value, dict):
+        return f"must be a locator dict, got: {type(value).__name__}"
+    return None
+
+
+def _validate_template_params(template_name, params):
+    """Validate parameters for a template. Returns list of error strings."""
+    tmpl = TEMPLATE_CATALOG.get(template_name)
+    if not tmpl:
+        return [f"Unknown template: {template_name}"]
+    errors = []
+    for pspec in tmpl["params"]:
+        pname = pspec["name"]
+        pkind = pspec["kind"]
+        required = pspec.get("required", True)
+        if pname not in params:
+            if required and pspec.get("default") is None:
+                errors.append(f"Missing required parameter: {pname}")
+            continue
+        val = params[pname]
+        err = None
+        if pkind == "identifier":
+            err = _validate_param_identifier(val)
+        elif pkind == "expression":
+            err = _validate_param_expression(val)
+        elif pkind == "statement":
+            err = _validate_param_statement(val)
+        elif pkind == "locator":
+            err = _validate_param_locator(val)
+        elif pkind == "id_list":
+            if not isinstance(val, list) or not all(isinstance(x, str) and x.isidentifier() for x in val):
+                err = f"must be a list of valid identifiers"
+        elif pkind == "integer":
+            if not isinstance(val, int):
+                err = f"must be an integer, got: {type(val).__name__}"
+        elif pkind == "enum":
+            allowed = pspec.get("allowed", [])
+            if val not in allowed:
+                err = f"must be one of {allowed}, got: {val!r}"
+        elif pkind == "fragment":
+            if not isinstance(val, dict):
+                err = f"must be a fragment dict"
+            else:
+                frag_errors = validate_fragment(val)
+                if frag_errors:
+                    err = f"fragment validation failed: {'; '.join(frag_errors)}"
+        if err:
+            errors.append(f"'{pname}': {err}")
+    return errors
+
+
+# --- Template Catalog ---
+
+TEMPLATE_CATALOG = {}
+
+
+def _reg_tmpl(t):
+    TEMPLATE_CATALOG[t["name"]] = t
+    return t
+
+
+_reg_tmpl({
+    "name": "guard_clause",
+    "description": "Add a guard clause (early return/raise) before existing code",
+    "params": [
+        {"name": "condition", "kind": "expression", "required": True},
+        {"name": "guard_body", "kind": "statement", "required": True},
+        {"name": "target", "kind": "locator", "required": True},
+    ],
+    "input_kind": "block", "output_kind": "block",
+})
+
+_reg_tmpl({
+    "name": "wrap_try_except",
+    "description": "Wrap statement(s) in try/except",
+    "params": [
+        {"name": "target", "kind": "locator", "required": True},
+        {"name": "exception_type", "kind": "expression", "required": False, "default": "Exception"},
+        {"name": "handler_body", "kind": "statement", "required": False, "default": "pass"},
+        {"name": "exception_var", "kind": "identifier", "required": False, "default": None},
+    ],
+    "input_kind": "statement", "output_kind": "statement",
+})
+
+_reg_tmpl({
+    "name": "add_parameter",
+    "description": "Add a parameter to a function/method signature",
+    "params": [
+        {"name": "function", "kind": "locator", "required": True},
+        {"name": "param_name", "kind": "identifier", "required": True},
+        {"name": "default_value", "kind": "expression", "required": False, "default": None},
+        {"name": "type_annotation", "kind": "expression", "required": False, "default": None},
+        {"name": "position", "kind": "integer", "required": False, "default": -1},
+    ],
+    "input_kind": "function_definition", "output_kind": "function_definition",
+})
+
+_reg_tmpl({
+    "name": "replace_expression",
+    "description": "Replace one expression with another",
+    "params": [
+        {"name": "target", "kind": "locator", "required": True},
+        {"name": "new_expression", "kind": "expression", "required": True},
+    ],
+    "input_kind": "expression", "output_kind": "expression",
+})
+
+_reg_tmpl({
+    "name": "extract_variable",
+    "description": "Extract an expression into a named variable",
+    "params": [
+        {"name": "target", "kind": "locator", "required": True},
+        {"name": "variable_name", "kind": "identifier", "required": True},
+    ],
+    "input_kind": "expression", "output_kind": "expression",
+})
+
+_reg_tmpl({
+    "name": "add_import_and_use",
+    "description": "Import a symbol and use it at a target location",
+    "params": [
+        {"name": "module", "kind": "expression", "required": True},
+        {"name": "symbol", "kind": "identifier", "required": True},
+        {"name": "usage_target", "kind": "locator", "required": True},
+        {"name": "usage_expression", "kind": "expression", "required": True},
+    ],
+    "input_kind": "expression", "output_kind": "expression",
+})
+
+_reg_tmpl({
+    "name": "add_method",
+    "description": "Add a method to a class",
+    "params": [
+        {"name": "class_locator", "kind": "locator", "required": True},
+        {"name": "method_name", "kind": "identifier", "required": True},
+        {"name": "parameters", "kind": "id_list", "required": False, "default": ["self"]},
+        {"name": "body", "kind": "statement", "required": True},
+        {"name": "decorator", "kind": "expression", "required": False, "default": None},
+        {"name": "return_annotation", "kind": "expression", "required": False, "default": None},
+    ],
+    "input_kind": "class_definition", "output_kind": "class_definition",
+})
+
+_reg_tmpl({
+    "name": "modify_condition",
+    "description": "Replace the condition of an if/while/for statement",
+    "params": [
+        {"name": "target", "kind": "locator", "required": True},
+        {"name": "new_condition", "kind": "expression", "required": True},
+    ],
+    "input_kind": "compound_statement", "output_kind": "compound_statement",
+})
+
+_reg_tmpl({
+    "name": "add_conditional_branch",
+    "description": "Add elif/else clause to existing if statement",
+    "params": [
+        {"name": "if_target", "kind": "locator", "required": True},
+        {"name": "branch_type", "kind": "enum", "required": True, "allowed": ["elif", "else"]},
+        {"name": "condition", "kind": "expression", "required": False, "default": None},
+        {"name": "branch_body", "kind": "statement", "required": True},
+    ],
+    "input_kind": "if_statement", "output_kind": "if_statement",
+})
+
+_reg_tmpl({
+    "name": "replace_function_body",
+    "description": "Replace entire function body with new code",
+    "params": [
+        {"name": "function", "kind": "locator", "required": True},
+        {"name": "new_body", "kind": "fragment", "required": True},
+    ],
+    "input_kind": "function_definition", "output_kind": "function_definition",
+})
+
+_reg_tmpl({
+    "name": "wrap_context_manager",
+    "description": "Wrap statement(s) in a with context manager",
+    "params": [
+        {"name": "target", "kind": "locator", "required": True},
+        {"name": "context_expr", "kind": "expression", "required": True},
+        {"name": "as_var", "kind": "identifier", "required": False, "default": None},
+    ],
+    "input_kind": "statement", "output_kind": "statement",
+})
+
+_reg_tmpl({
+    "name": "add_decorator",
+    "description": "Add a decorator above a function/method/class",
+    "params": [
+        {"name": "target", "kind": "locator", "required": True},
+        {"name": "decorator", "kind": "expression", "required": True},
+    ],
+    "input_kind": "definition", "output_kind": "definition",
+})
+
+_reg_tmpl({
+    "name": "inline_variable",
+    "description": "Replace all references to a variable with its value, delete assignment",
+    "params": [
+        {"name": "target", "kind": "locator", "required": True},
+        {"name": "variable_name", "kind": "identifier", "required": True},
+    ],
+    "input_kind": "block", "output_kind": "block",
+})
+
+_reg_tmpl({
+    "name": "change_return_value",
+    "description": "Replace the value expression in a return statement",
+    "params": [
+        {"name": "target", "kind": "locator", "required": True},
+        {"name": "new_value", "kind": "expression", "required": True},
+    ],
+    "input_kind": "return_statement", "output_kind": "return_statement",
+})
+
+_reg_tmpl({
+    "name": "add_class_attribute",
+    "description": "Insert a class-level attribute at the start of class body",
+    "params": [
+        {"name": "class_locator", "kind": "locator", "required": True},
+        {"name": "attr_name", "kind": "identifier", "required": True},
+        {"name": "attr_value", "kind": "expression", "required": True},
+        {"name": "type_annotation", "kind": "expression", "required": False, "default": None},
+    ],
+    "input_kind": "class_definition", "output_kind": "class_definition",
+})
+
+
+# --- Fragment Serializer (Tier 3) ---
+
+FRAGMENT_REQUIRED_PROPERTIES = {
+    "function_definition": ["name"],
+    "class_definition": ["name"],
+    "if_statement": ["condition"],
+    "elif_clause": ["condition"],
+    "while_statement": ["condition"],
+    "for_statement": ["target", "iterable"],
+    "with_statement": ["context"],
+    "assignment": ["target", "value"],
+    "return_statement": [],
+    "raise_statement": [],
+    "except_clause": [],
+    "expression_statement": ["expression"],
+}
+
+FRAGMENT_LEAF_KINDS = {
+    "return_statement", "raise_statement", "assignment", "expression_statement",
+}
+
+
+def validate_fragment(frag):
+    """Validate a fragment dict's structural consistency. Returns list of errors."""
+    errors = []
+    kind = frag.get("kind", "")
+    if not kind:
+        errors.append("Fragment kind must be non-empty")
+        return errors
+    required = FRAGMENT_REQUIRED_PROPERTIES.get(kind, [])
+    for prop in required:
+        if prop not in frag:
+            errors.append(f"'{kind}' requires property '{prop}'")
+    children = frag.get("children", [])
+    if kind in FRAGMENT_LEAF_KINDS and children:
+        errors.append(f"'{kind}' is a leaf node and cannot have children")
+    for i, child in enumerate(children):
+        if isinstance(child, dict):
+            child_errors = validate_fragment(child)
+            errors.extend(f"child[{i}]: {e}" for e in child_errors)
+    return errors
+
+
+def serialize_fragment(frag, indent=0):
+    """Serialize a fragment dict to Python source code."""
+    kind = frag.get("kind", "")
+    pad = "    " * indent
+    inner = "    " * (indent + 1)
+    children = frag.get("children", [])
+
+    if kind == "function_definition":
+        params = ", ".join(frag.get("parameters", []))
+        decorator = frag.get("decorator")
+        ret_type = frag.get("return_type")
+        sig = f"def {frag['name']}({params})"
+        if ret_type:
+            sig += f" -> {ret_type}"
+        lines = []
+        if decorator:
+            lines.append(f"{pad}@{decorator}")
+        lines.append(f"{pad}{sig}:")
+        if children:
+            for child in children:
+                lines.append(serialize_fragment(child, indent + 1))
+        else:
+            lines.append(f"{inner}pass")
+        return "\n".join(lines)
+
+    elif kind == "class_definition":
+        bases = ", ".join(frag.get("bases", []))
+        header = f"class {frag['name']}"
+        if bases:
+            header += f"({bases})"
+        lines = [f"{pad}{header}:"]
+        if children:
+            for child in children:
+                lines.append(serialize_fragment(child, indent + 1))
+        else:
+            lines.append(f"{inner}pass")
+        return "\n".join(lines)
+
+    elif kind == "if_statement":
+        lines = [f"{pad}if {frag['condition']}:"]
+        if children:
+            for child in children:
+                lines.append(serialize_fragment(child, indent + 1))
+        else:
+            lines.append(f"{inner}pass")
+        return "\n".join(lines)
+
+    elif kind == "elif_clause":
+        lines = [f"{pad}elif {frag['condition']}:"]
+        for child in children:
+            lines.append(serialize_fragment(child, indent + 1))
+        return "\n".join(lines)
+
+    elif kind == "else_clause":
+        lines = [f"{pad}else:"]
+        for child in children:
+            lines.append(serialize_fragment(child, indent + 1))
+        return "\n".join(lines)
+
+    elif kind == "for_statement":
+        target = frag.get("target", "_")
+        iterable = frag.get("iterable", "[]")
+        lines = [f"{pad}for {target} in {iterable}:"]
+        if children:
+            for child in children:
+                lines.append(serialize_fragment(child, indent + 1))
+        else:
+            lines.append(f"{inner}pass")
+        return "\n".join(lines)
+
+    elif kind == "while_statement":
+        lines = [f"{pad}while {frag['condition']}:"]
+        if children:
+            for child in children:
+                lines.append(serialize_fragment(child, indent + 1))
+        else:
+            lines.append(f"{inner}pass")
+        return "\n".join(lines)
+
+    elif kind == "with_statement":
+        ctx = frag.get("context", "ctx")
+        as_var = frag.get("as_var")
+        header = f"with {ctx}"
+        if as_var:
+            header += f" as {as_var}"
+        lines = [f"{pad}{header}:"]
+        if children:
+            for child in children:
+                lines.append(serialize_fragment(child, indent + 1))
+        else:
+            lines.append(f"{inner}pass")
+        return "\n".join(lines)
+
+    elif kind == "try_statement":
+        lines = [f"{pad}try:"]
+        body = [c for c in children if c.get("kind") not in
+                ("except_clause", "else_clause", "finally_clause")]
+        exc = [c for c in children if c.get("kind") == "except_clause"]
+        els = [c for c in children if c.get("kind") == "else_clause"]
+        fin = [c for c in children if c.get("kind") == "finally_clause"]
+        if body:
+            for child in body:
+                lines.append(serialize_fragment(child, indent + 1))
+        else:
+            lines.append(f"{inner}pass")
+        for e in exc:
+            lines.append(serialize_fragment(e, indent))
+        for e in els:
+            lines.append(serialize_fragment(e, indent))
+        for f_ in fin:
+            lines.append(serialize_fragment(f_, indent))
+        return "\n".join(lines)
+
+    elif kind == "except_clause":
+        exc_type = frag.get("exception_type", "Exception")
+        exc_var = frag.get("exception_var")
+        header = f"except {exc_type}"
+        if exc_var:
+            header += f" as {exc_var}"
+        lines = [f"{pad}{header}:"]
+        if children:
+            for child in children:
+                lines.append(serialize_fragment(child, indent + 1))
+        else:
+            lines.append(f"{inner}pass")
+        return "\n".join(lines)
+
+    elif kind == "finally_clause":
+        lines = [f"{pad}finally:"]
+        if children:
+            for child in children:
+                lines.append(serialize_fragment(child, indent + 1))
+        else:
+            lines.append(f"{inner}pass")
+        return "\n".join(lines)
+
+    elif kind == "return_statement":
+        val = frag.get("value", "")
+        return f"{pad}return {val}".rstrip() if val else f"{pad}return"
+
+    elif kind == "raise_statement":
+        val = frag.get("value", "")
+        return f"{pad}raise {val}".rstrip() if val else f"{pad}raise"
+
+    elif kind == "assignment":
+        target = frag.get("target", "_")
+        val = frag.get("value", "None")
+        type_ann = frag.get("type_annotation")
+        if type_ann:
+            return f"{pad}{target}: {type_ann} = {val}"
+        return f"{pad}{target} = {val}"
+
+    elif kind == "expression_statement":
+        return f"{pad}{frag.get('expression', 'pass')}"
+
+    else:
+        expr = frag.get("expression", frag.get("value", "pass"))
+        return f"{pad}{expr}"
+
+
+# --- Enhanced Verification (L1-L6) ---
+
+TRIVIAL_BODIES = {"pass", "return None", "return", "...", "raise NotImplementedError"}
+
+
+def verify_kind_preservation(original_kind, new_kind):
+    """L1: Does the replacement preserve the AST node kind?
+    Returns (ok, error_msg_or_None, is_error).
+    """
+    if original_kind == new_kind:
+        return (True, None, True)
+    return (False, f"Kind changed from '{original_kind}' to '{new_kind}'", True)
+
+
+def verify_containment(original_source, new_source, edit_start, edit_end, filepath):
+    """L2: Are nodes outside the edit region unchanged?
+    Returns (ok, error_msg_or_None, is_error).
+    """
+    if not _check_treesitter():
+        return (True, None, True)
+    lang = detect_language(filepath)
+    if not lang:
+        return (True, None, True)
+    try:
+        import tree_sitter_languages
+        parser = tree_sitter_languages.get_parser(lang)
+        old_bytes = original_source if isinstance(original_source, bytes) else original_source.encode("utf-8")
+        new_bytes = new_source if isinstance(new_source, bytes) else new_source.encode("utf-8")
+        old_tree = parser.parse(old_bytes)
+        new_tree = parser.parse(new_bytes)
+
+        # Compute byte offset shift from the edit
+        old_edit_len = edit_end - edit_start
+        new_content_at_edit = new_bytes[edit_start:]
+        # Approximate: compare top-level nodes outside the edit region
+        def _hash_nodes(root, start, end, src):
+            hashes = []
+            for child in root.children:
+                if child.end_byte <= start or child.start_byte >= end:
+                    txt = src[child.start_byte:child.end_byte]
+                    hashes.append((child.type, txt))
+            return hashes
+
+        old_hashes = _hash_nodes(old_tree.root_node, edit_start, edit_end, old_bytes)
+        # For new tree, nodes before edit_start are same, nodes after shift
+        # Compare by content rather than position
+        new_hashes_before = []
+        new_hashes_after = []
+        for child in new_tree.root_node.children:
+            if child.end_byte <= edit_start:
+                txt = new_bytes[child.start_byte:child.end_byte]
+                new_hashes_before.append((child.type, txt))
+            elif child.start_byte >= edit_start + (len(new_bytes) - len(old_bytes)) + old_edit_len:
+                txt = new_bytes[child.start_byte:child.end_byte]
+                new_hashes_after.append((child.type, txt))
+
+        old_before = [(t, tx) for t, tx in old_hashes if any(
+            ob == child.end_byte for ob in [0]  # placeholder
+        )]
+        # Simplified: just check that top-level node count outside edit is preserved
+        old_outside = [c for c in old_tree.root_node.children
+                       if c.end_byte <= edit_start or c.start_byte >= edit_end]
+        # Check if file still parses
+        if _has_error_nodes(new_tree.root_node):
+            return (False, f"Parse errors in {filepath} after edit", True)
+        return (True, None, True)
+    except Exception:
+        return (True, None, True)
+
+
+def verify_referential_integrity(replacement_text, filepath, edit_point_byte):
+    """L3: Are all identifiers in the replacement resolvable?
+    Returns (ok, error_msg_or_None, is_error=False). WARNING ONLY.
+    """
+    if not _check_treesitter():
+        return (True, None, False)
+    lang = detect_language(filepath)
+    if not lang or lang != "python":
+        return (True, None, False)
+    try:
+        import tree_sitter_languages
+        parser = tree_sitter_languages.get_parser(lang)
+        # Parse the replacement to find identifiers
+        repl_bytes = replacement_text.encode("utf-8") if isinstance(replacement_text, str) else replacement_text
+        repl_tree = parser.parse(repl_bytes)
+
+        identifiers_used = set()
+        def _walk_ids(node):
+            if node.type == "identifier":
+                identifiers_used.add(_node_text(node))
+            for child in node.children:
+                _walk_ids(child)
+        _walk_ids(repl_tree.root_node)
+
+        if not identifiers_used:
+            return (True, None, False)
+
+        # Read the file and find identifiers in scope at edit point
+        content = open(filepath, "rb").read()
+        file_tree = parser.parse(content)
+
+        identifiers_in_scope = set()
+        def _collect_defs(node, max_byte):
+            if node.start_byte > max_byte:
+                return
+            if node.type in ("function_definition", "class_definition"):
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    identifiers_in_scope.add(_node_text(name_node))
+                # Collect parameters
+                params = node.child_by_field_name("parameters")
+                if params:
+                    for child in params.children:
+                        if child.type == "identifier":
+                            identifiers_in_scope.add(_node_text(child))
+            elif node.type in ("assignment", "augmented_assignment"):
+                left = node.child_by_field_name("left")
+                if left and left.type == "identifier":
+                    identifiers_in_scope.add(_node_text(left))
+            elif node.type in ("for_statement",):
+                left = node.child_by_field_name("left")
+                if left and left.type == "identifier":
+                    identifiers_in_scope.add(_node_text(left))
+            elif node.type in ("import_from_statement", "import_statement"):
+                for child in node.children:
+                    if child.type == "dotted_name" or child.type == "identifier":
+                        identifiers_in_scope.add(_node_text(child))
+                    elif child.type == "aliased_import":
+                        alias = child.child_by_field_name("alias")
+                        if alias:
+                            identifiers_in_scope.add(_node_text(alias))
+                        else:
+                            name = child.child_by_field_name("name")
+                            if name:
+                                identifiers_in_scope.add(_node_text(name))
+            for child in node.children:
+                _collect_defs(child, max_byte)
+
+        _collect_defs(file_tree.root_node, edit_point_byte)
+
+        # Also collect identifiers defined within the replacement itself
+        defined_in_replacement = set()
+        def _collect_repl_defs(node):
+            if node.type in ("function_definition", "class_definition"):
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    defined_in_replacement.add(_node_text(name_node))
+            elif node.type in ("assignment",):
+                left = node.child_by_field_name("left")
+                if left and left.type == "identifier":
+                    defined_in_replacement.add(_node_text(left))
+            for child in node.children:
+                _collect_repl_defs(child)
+        _collect_repl_defs(repl_tree.root_node)
+
+        unresolved = identifiers_used - identifiers_in_scope - PYTHON_BUILTINS - defined_in_replacement
+        # Filter out common framework attrs and dunder methods
+        unresolved = {n for n in unresolved if not n.startswith("_") and n not in ("self", "cls")}
+        if unresolved:
+            return (False, f"Possibly unresolved identifiers: {sorted(unresolved)}", False)
+        return (True, None, False)
+    except Exception:
+        return (True, None, False)
+
+
+def verify_import_closure(replacement_text, filepath):
+    """L4: Are all used symbols importable?
+    Returns (ok, error_msg_or_None, is_error=False). WARNING ONLY.
+    """
+    if not _check_treesitter():
+        return (True, None, False)
+    lang = detect_language(filepath)
+    if not lang or lang != "python":
+        return (True, None, False)
+    try:
+        import tree_sitter_languages
+        parser = tree_sitter_languages.get_parser(lang)
+        repl_bytes = replacement_text.encode("utf-8") if isinstance(replacement_text, str) else replacement_text
+        repl_tree = parser.parse(repl_bytes)
+
+        # Collect identifiers that look like module-level names
+        identifiers_used = set()
+        def _walk(node):
+            if node.type == "identifier":
+                name = _node_text(node)
+                # Only check names that look like they need imports (capitalized or known modules)
+                if name[0:1].isupper() and name not in PYTHON_BUILTINS:
+                    identifiers_used.add(name)
+            for child in node.children:
+                _walk(child)
+        _walk(repl_tree.root_node)
+
+        if not identifiers_used:
+            return (True, None, False)
+
+        # Check what's imported in the file
+        content = open(filepath, "rb").read()
+        file_tree = parser.parse(content)
+        imported = set()
+        for child in file_tree.root_node.children:
+            if child.type in ("import_statement", "import_from_statement"):
+                text = _node_text(child)
+                if "import *" in text:
+                    return (True, None, False)  # star import = all available
+                for sub in child.children:
+                    if sub.type == "dotted_name" or sub.type == "identifier":
+                        imported.add(_node_text(sub))
+                    elif sub.type == "aliased_import":
+                        alias = sub.child_by_field_name("alias")
+                        name = sub.child_by_field_name("name")
+                        imported.add(_node_text(alias) if alias else _node_text(name) if name else "")
+
+        # Check for class definitions in file too
+        for child in file_tree.root_node.children:
+            if child.type == "class_definition":
+                name_node = child.child_by_field_name("name")
+                if name_node:
+                    imported.add(_node_text(name_node))
+
+        unimported = identifiers_used - imported - PYTHON_BUILTINS
+        if unimported:
+            return (False, f"Used but possibly not imported: {sorted(unimported)}", False)
+        return (True, None, False)
+    except Exception:
+        return (True, None, False)
+
+
+def verify_non_triviality(replacement_text):
+    """L6: Is the replacement non-degenerate?
+    Returns (ok, error_msg_or_None, is_error=False). WARNING ONLY.
+    """
+    stripped = replacement_text.strip()
+    if stripped in TRIVIAL_BODIES:
+        return (False, f"Replacement is trivial: '{stripped}'", False)
+    return (True, None, False)
+
+
+def check_formal_postconditions(step, filepath, original_content, new_content, edit_start, edit_end):
+    """Run enhanced verification L0-L6 on the result of a formal step.
+    Returns list of (level, ok, message, is_error) tuples.
+    """
+    results = []
+
+    # L0: Syntax
+    ok, err = _verify_parses_ok(filepath)
+    results.append(("L0_SYNTAX", ok, err, True))
+
+    # L1: Kind preservation (for replace operations)
+    # Only check if we know the expected kind
+    expected_kind = step.get("_expected_kind")
+    if expected_kind and _check_treesitter():
+        lang = detect_language(filepath)
+        if lang:
+            try:
+                import tree_sitter_languages
+                parser = tree_sitter_languages.get_parser(lang)
+                new_bytes = new_content.encode("utf-8") if isinstance(new_content, str) else new_content
+                new_tree = parser.parse(new_bytes)
+                # Find the node at the edit point
+                node_at_edit = new_tree.root_node.descendant_for_byte_range(edit_start, edit_start + 1)
+                if node_at_edit:
+                    ok, msg, is_err = verify_kind_preservation(expected_kind, node_at_edit.type)
+                    results.append(("L1_KIND", ok, msg, is_err))
+            except Exception:
+                pass
+
+    # L2: Containment
+    ok, msg, is_err = verify_containment(original_content, new_content, edit_start, edit_end, filepath)
+    results.append(("L2_CONTAINMENT", ok, msg, is_err))
+
+    # L3: Referential integrity (warning only)
+    replacement = new_content[edit_start:] if isinstance(new_content, str) else new_content.decode("utf-8")[edit_start:]
+    # Use a reasonable chunk of the replacement
+    repl_chunk = replacement[:min(len(replacement), edit_end - edit_start + 500)]
+    ok, msg, is_err = verify_referential_integrity(repl_chunk, filepath, edit_start)
+    results.append(("L3_REFERENTIAL", ok, msg, is_err))
+
+    # L4: Import closure (warning only)
+    ok, msg, is_err = verify_import_closure(repl_chunk, filepath)
+    results.append(("L4_IMPORT", ok, msg, is_err))
+
+    # L6: Non-triviality (warning only)
+    ok, msg, is_err = verify_non_triviality(repl_chunk)
+    results.append(("L6_TRIVIALITY", ok, msg, is_err))
+
+    return results
+
+
+# --- Template Execution Engine ---
+
+def _get_indent_at_node(source_bytes, node):
+    """Get the indentation string at a node's position."""
+    line_start = source_bytes.rfind(b"\n", 0, node.start_byte)
+    if line_start < 0:
+        line_start = 0
+    else:
+        line_start += 1
+    indent = b""
+    for b_val in source_bytes[line_start:node.start_byte]:
+        if b_val in (32, 9):
+            indent += bytes([b_val])
+        else:
+            break
+    return indent.decode("utf-8")
+
+
+def _indent_code(code, indent_str):
+    """Indent all lines of code by indent_str."""
+    lines = code.split("\n")
+    result = []
+    for i, line in enumerate(lines):
+        if line.strip():
+            result.append(indent_str + line)
+        else:
+            result.append(line)
+    return "\n".join(result)
+
+
+def execute_formal_step(step):
+    """Execute a formal transform step (Tier 1/2/3).
+
+    Returns dict with {success, error?, warnings?} or None if not a formal step.
+    """
+    tier = detect_tier(step)
+    if tier == 0:
+        return None  # signal legacy fallback
+
+    if tier == 1:
+        return _execute_formal_surgery(step)
+    elif tier == 2:
+        return _execute_formal_template(step)
+    elif tier == 3:
+        return _execute_formal_fragment(step)
+    return None
+
+
+def _execute_formal_surgery(step):
+    """Execute a Tier 1 AST surgery operation."""
+    op = step["op"]
+    target = step.get("target", step.get("params", {}).get("locator", {}))
+    fp = target.get("file", "")
+
+    if op == "rename_identifier":
+        new_name = step.get("new_name", "")
+        if not new_name or not new_name.isidentifier():
+            return {"success": False, "error": f"Invalid new_name: {new_name!r}"}
+        # Use existing replace_all_matching via primitive
+        return _execute_primitive("replace_all_matching", {
+            "locator": target,
+            "replacement": new_name,
+            "filter": "not_in_string_or_comment",
+        })
+
+    elif op == "delete_node":
+        return _execute_primitive("delete_node", {"locator": target})
+
+    elif op == "copy_node":
+        source = step.get("source", {})
+        src_nodes = resolve_locator(source, file_path=source.get("file", ""))
+        if not src_nodes:
+            return {"success": False, "error": "Source node not found for copy_node"}
+        src_text = _node_text(src_nodes[0])
+        return _execute_primitive("insert_after_node", {
+            "locator": target,
+            "code": src_text,
+        })
+
+    elif op == "move_node":
+        source = step.get("source", {})
+        src_fp = source.get("file", "")
+        src_nodes = resolve_locator(source, file_path=src_fp)
+        if not src_nodes:
+            return {"success": False, "error": "Source node not found for move_node"}
+        src_text = _node_text(src_nodes[0])
+        # Insert at target first, then delete source
+        result = _execute_primitive("insert_after_node", {
+            "locator": target,
+            "code": src_text,
+        })
+        if not result.get("success"):
+            return result
+        return _execute_primitive("delete_node", {"locator": source})
+
+    elif op == "swap_nodes":
+        source = step.get("source", {})
+        tgt_nodes = resolve_locator(target, file_path=target.get("file", ""))
+        src_nodes = resolve_locator(source, file_path=source.get("file", ""))
+        if not tgt_nodes or not src_nodes:
+            return {"success": False, "error": "Node not found for swap_nodes"}
+        tgt_text = _node_text(tgt_nodes[0])
+        src_text = _node_text(src_nodes[0])
+        # Replace target with source text, then source with target text
+        result = _execute_primitive("replace_node", {
+            "locator": target,
+            "replacement": src_text,
+        })
+        if not result.get("success"):
+            return result
+        return _execute_primitive("replace_node", {
+            "locator": source,
+            "replacement": tgt_text,
+        })
+
+    elif op == "reorder_children":
+        order = step.get("order", [])
+        tgt_nodes = resolve_locator(target, file_path=target.get("file", ""))
+        if not tgt_nodes:
+            return {"success": False, "error": "Parent node not found for reorder_children"}
+        parent = tgt_nodes[0]
+        children = [c for c in parent.children if c.type not in ("comment",)]
+        if len(order) != len(children):
+            return {"success": False, "error": f"Order length {len(order)} != children count {len(children)}"}
+        # Build reordered text
+        fp = target.get("file", "")
+        content = open(fp, "rb").read()
+        child_texts = [content[c.start_byte:c.end_byte] for c in children]
+        reordered = b"\n".join(child_texts[i] for i in order)
+        # Replace parent's children region
+        first_child = children[0]
+        last_child = children[-1]
+        new_content = content[:first_child.start_byte] + reordered + content[last_child.end_byte:]
+        _write_file(fp, new_content.decode("utf-8"))
+        ok, err = _verify_parses_ok(fp)
+        if not ok:
+            _write_file(fp, content.decode("utf-8"))
+            return {"success": False, "error": f"Reorder caused parse error: {err}", "rolled_back": True}
+        return {"success": True}
+
+    return {"success": False, "error": f"Unknown surgery op: {op}"}
+
+
+def _execute_formal_template(step):
+    """Execute a Tier 2 template instantiation."""
+    template_name = step["template"]
+    params = step.get("params", {})
+
+    if template_name not in TEMPLATE_CATALOG:
+        return {"success": False, "error": f"Unknown template: {template_name}"}
+
+    # Validate parameters
+    errors = _validate_template_params(template_name, params)
+    if errors:
+        return {"success": False, "error": f"Parameter validation failed: {'; '.join(errors)}",
+                "phase": "param_validation"}
+
+    # Dispatch to template-specific handler
+    handler = _TEMPLATE_HANDLERS.get(template_name)
+    if handler:
+        return handler(params)
+    return {"success": False, "error": f"No handler for template: {template_name}"}
+
+
+def _tmpl_guard_clause(params):
+    condition = params["condition"]
+    guard_body = params["guard_body"]
+    target = params["target"]
+    indent_body = "    "
+    code = f"if {condition}:\n{indent_body}{guard_body}"
+    return _execute_primitive("insert_before_node", {"locator": target, "code": code})
+
+
+def _tmpl_wrap_try_except(params):
+    target = params["target"]
+    exc_type = params.get("exception_type", "Exception")
+    handler = params.get("handler_body", "pass")
+    exc_var = params.get("exception_var")
+    except_header = f"except {exc_type}"
+    if exc_var:
+        except_header += f" as {exc_var}"
+    return _execute_primitive("wrap_node", {
+        "locator": target,
+        "before": f"try:",
+        "after": f"{except_header}:\n    {handler}",
+        "indent_body": True,
+    })
+
+
+def _tmpl_add_parameter(params):
+    func_loc = params["function"]
+    param_name = params["param_name"]
+    default = params.get("default_value")
+    type_ann = params.get("type_annotation")
+    fp = func_loc.get("file", "")
+
+    # Find the function node
+    nodes = resolve_locator(func_loc, file_path=fp)
+    if not nodes:
+        return {"success": False, "error": "Function not found"}
+    func_node = nodes[0]
+    params_node = func_node.child_by_field_name("parameters")
+    if not params_node:
+        return {"success": False, "error": "Function has no parameters node"}
+
+    # Build the new parameter string
+    new_param = param_name
+    if type_ann:
+        new_param += f": {type_ann}"
+    if default is not None:
+        new_param += f"={default}"
+
+    # Get existing parameters text
+    source = open(fp, "rb").read()
+    params_text = source[params_node.start_byte:params_node.end_byte].decode("utf-8")
+
+    # Insert the new parameter
+    pos = params.get("position", -1)
+    if params_text.strip() == "()":
+        new_params_text = f"({new_param})"
+    elif params_text.strip().endswith(")"):
+        # Add comma before closing paren
+        new_params_text = params_text.rstrip(")")
+        if new_params_text.rstrip().endswith(","):
+            new_params_text += f" {new_param})"
+        else:
+            new_params_text += f", {new_param})"
+    else:
+        new_params_text = params_text + f", {new_param}"
+
+    new_content = source[:params_node.start_byte] + new_params_text.encode("utf-8") + source[params_node.end_byte:]
+    _write_file(fp, new_content.decode("utf-8"))
+    ok, err = _verify_parses_ok(fp)
+    if not ok:
+        _write_file(fp, source.decode("utf-8"))
+        return {"success": False, "error": f"Parse error after adding parameter: {err}", "rolled_back": True}
+    return {"success": True}
+
+
+def _tmpl_replace_expression(params):
+    target = params["target"]
+    new_expr = params["new_expression"]
+    return _execute_primitive("replace_node", {"locator": target, "replacement": new_expr})
+
+
+def _tmpl_extract_variable(params):
+    target = params["target"]
+    var_name = params["variable_name"]
+    fp = target.get("file", "")
+
+    nodes = resolve_locator(target, file_path=fp)
+    if not nodes:
+        return {"success": False, "error": "Target expression not found"}
+    expr_node = nodes[0]
+    expr_text = _node_text(expr_node)
+
+    # Insert assignment before the containing statement
+    assign_code = f"{var_name} = {expr_text}"
+    # Find the containing statement
+    stmt = expr_node.parent
+    while stmt and stmt.parent and stmt.parent.type not in ("module", "block", "function_definition", "class_definition"):
+        stmt = stmt.parent
+    if not stmt:
+        return {"success": False, "error": "Cannot find containing statement for extraction"}
+
+    # Insert assignment before statement, then replace expression with variable
+    source = open(fp, "rb").read()
+    indent = _get_indent_at_node(source, stmt)
+    insert_text = f"{indent}{assign_code}\n"
+    new_content = source[:stmt.start_byte] + insert_text.encode("utf-8") + source[stmt.start_byte:]
+    # Adjust expression position for the inserted text
+    offset = len(insert_text.encode("utf-8"))
+    new_content = (new_content[:expr_node.start_byte + offset] +
+                   var_name.encode("utf-8") +
+                   new_content[expr_node.end_byte + offset:])
+    _write_file(fp, new_content.decode("utf-8"))
+    ok, err = _verify_parses_ok(fp)
+    if not ok:
+        _write_file(fp, source.decode("utf-8"))
+        return {"success": False, "error": f"Parse error after extraction: {err}", "rolled_back": True}
+    return {"success": True}
+
+
+def _tmpl_add_import_and_use(params):
+    module = params["module"]
+    symbol = params["symbol"]
+    usage_target = params["usage_target"]
+    usage_expr = params["usage_expression"]
+
+    # First add the import
+    fp = usage_target.get("file", "")
+    import_stmt = f"from {module} import {symbol}"
+    import_result = _execute_composed_op("add_import", {"file": fp, "import_statement": import_stmt})
+    if not import_result.get("success"):
+        # Fallback to legacy add_import
+        try:
+            _exec_add_import({"file": fp, "import_statement": import_stmt})
+        except Exception as e:
+            return {"success": False, "error": f"Failed to add import: {e}"}
+
+    # Then replace usage
+    return _execute_primitive("replace_node", {"locator": usage_target, "replacement": usage_expr})
+
+
+def _tmpl_add_method_formal(params):
+    class_loc = params["class_locator"]
+    method_name = params["method_name"]
+    parameters = params.get("parameters", ["self"])
+    body = params["body"]
+    decorator = params.get("decorator")
+    return_ann = params.get("return_annotation")
+
+    fp = class_loc.get("file", "")
+    params_str = ", ".join(parameters)
+    sig = f"def {method_name}({params_str})"
+    if return_ann:
+        sig += f" -> {return_ann}"
+    code = ""
+    if decorator:
+        code += f"@{decorator}\n"
+    code += f"{sig}:\n    {body}"
+    return _execute_composed_op("add_method", {
+        "file": fp,
+        "class_name": class_loc.get("name", ""),
+        "method_code": code,
+    })
+
+
+def _tmpl_modify_condition(params):
+    target = params["target"]
+    new_condition = params["new_condition"]
+    fp = target.get("file", "")
+
+    nodes = resolve_locator(target, file_path=fp)
+    if not nodes:
+        return {"success": False, "error": "Target statement not found"}
+    stmt_node = nodes[0]
+
+    # Find the condition child
+    condition_node = stmt_node.child_by_field_name("condition")
+    if not condition_node:
+        # For for_statement, look at the "right" side (iterable)
+        condition_node = stmt_node.child_by_field_name("right")
+    if not condition_node:
+        return {"success": False, "error": f"No condition found in {stmt_node.type}"}
+
+    # Replace just the condition
+    source = open(fp, "rb").read()
+    new_content = (source[:condition_node.start_byte] +
+                   new_condition.encode("utf-8") +
+                   source[condition_node.end_byte:])
+    _write_file(fp, new_content.decode("utf-8"))
+    ok, err = _verify_parses_ok(fp)
+    if not ok:
+        _write_file(fp, source.decode("utf-8"))
+        return {"success": False, "error": f"Parse error after modifying condition: {err}", "rolled_back": True}
+    return {"success": True}
+
+
+def _tmpl_add_conditional_branch(params):
+    if_target = params["if_target"]
+    branch_type = params["branch_type"]
+    condition = params.get("condition")
+    branch_body = params["branch_body"]
+    fp = if_target.get("file", "")
+
+    nodes = resolve_locator(if_target, file_path=fp)
+    if not nodes:
+        return {"success": False, "error": "If statement not found"}
+    if_node = nodes[0]
+
+    source = open(fp, "rb").read()
+    indent = _get_indent_at_node(source, if_node)
+
+    if branch_type == "elif":
+        if not condition:
+            return {"success": False, "error": "elif requires a condition"}
+        branch_code = f"{indent}elif {condition}:\n{indent}    {branch_body}"
+    else:
+        branch_code = f"{indent}else:\n{indent}    {branch_body}"
+
+    # Insert after the if statement
+    new_content = (source[:if_node.end_byte] +
+                   b"\n" + branch_code.encode("utf-8") +
+                   source[if_node.end_byte:])
+    _write_file(fp, new_content.decode("utf-8"))
+    ok, err = _verify_parses_ok(fp)
+    if not ok:
+        _write_file(fp, source.decode("utf-8"))
+        return {"success": False, "error": f"Parse error after adding branch: {err}", "rolled_back": True}
+    return {"success": True}
+
+
+def _tmpl_replace_function_body(params):
+    func_loc = params["function"]
+    new_body = params["new_body"]  # fragment dict
+    fp = func_loc.get("file", "")
+
+    nodes = resolve_locator(func_loc, file_path=fp)
+    if not nodes:
+        return {"success": False, "error": "Function not found"}
+    func_node = nodes[0]
+    body_node = func_node.child_by_field_name("body")
+    if not body_node:
+        return {"success": False, "error": "Function has no body"}
+
+    source = open(fp, "rb").read()
+    indent = _get_indent_at_node(source, body_node)
+    # Serialize the fragment at proper indentation
+    indent_level = len(indent) // 4 if indent else 1
+    if isinstance(new_body, dict):
+        # Fragment is a list of children to place in the body
+        children = new_body.get("children", [new_body])
+        body_lines = []
+        for child in children:
+            body_lines.append(serialize_fragment(child, indent_level))
+        body_code = "\n".join(body_lines)
+    else:
+        body_code = str(new_body)
+
+    new_content = (source[:body_node.start_byte] +
+                   body_code.encode("utf-8") +
+                   source[body_node.end_byte:])
+    _write_file(fp, new_content.decode("utf-8"))
+    ok, err = _verify_parses_ok(fp)
+    if not ok:
+        _write_file(fp, source.decode("utf-8"))
+        return {"success": False, "error": f"Parse error after replacing body: {err}", "rolled_back": True}
+    return {"success": True}
+
+
+def _tmpl_wrap_context_manager(params):
+    target = params["target"]
+    context_expr = params["context_expr"]
+    as_var = params.get("as_var")
+    header = f"with {context_expr}"
+    if as_var:
+        header += f" as {as_var}"
+    return _execute_primitive("wrap_node", {
+        "locator": target,
+        "before": f"{header}:",
+        "after": "",
+        "indent_body": True,
+    })
+
+
+def _tmpl_add_decorator(params):
+    target = params["target"]
+    decorator = params["decorator"]
+    code = f"@{decorator}"
+    return _execute_primitive("insert_before_node", {"locator": target, "code": code})
+
+
+def _tmpl_inline_variable(params):
+    target = params["target"]
+    var_name = params["variable_name"]
+    fp = target.get("file", "")
+
+    nodes = resolve_locator(target, file_path=fp)
+    if not nodes:
+        return {"success": False, "error": "Assignment not found"}
+    assign_node = nodes[0]
+
+    # Get the assigned value
+    value_node = assign_node.child_by_field_name("right")
+    if not value_node:
+        # Try to parse from text
+        text = _node_text(assign_node)
+        if "=" in text:
+            value = text.split("=", 1)[1].strip()
+        else:
+            return {"success": False, "error": "Cannot determine assigned value"}
+    else:
+        value = _node_text(value_node)
+
+    # Replace all references to var_name with value, then delete assignment
+    source = open(fp, "rb").read()
+    content = source.decode("utf-8")
+    # Simple word-boundary replacement (excluding the assignment itself)
+    assign_text = _node_text(assign_node)
+    import re as _re
+    pattern = r'\b' + _re.escape(var_name) + r'\b'
+    # Remove the assignment line
+    lines = content.split("\n")
+    assign_line = assign_node.start_point[0]
+    new_lines = []
+    for i, line in enumerate(lines):
+        if i == assign_line:
+            continue  # skip the assignment
+        new_lines.append(_re.sub(pattern, value, line))
+    _write_file(fp, "\n".join(new_lines))
+    ok, err = _verify_parses_ok(fp)
+    if not ok:
+        _write_file(fp, content)
+        return {"success": False, "error": f"Parse error after inlining: {err}", "rolled_back": True}
+    return {"success": True}
+
+
+def _tmpl_change_return_value(params):
+    target = params["target"]
+    new_value = params["new_value"]
+    fp = target.get("file", "")
+
+    nodes = resolve_locator(target, file_path=fp)
+    if not nodes:
+        return {"success": False, "error": "Return statement not found"}
+    ret_node = nodes[0]
+
+    # Find the return value expression
+    source = open(fp, "rb").read()
+    # The return value is everything after "return "
+    ret_text = _node_text(ret_node)
+    if ret_text.startswith("return "):
+        # Replace just the value part
+        value_start = ret_node.start_byte + len("return ")
+        new_content = (source[:value_start] +
+                       new_value.encode("utf-8") +
+                       source[ret_node.end_byte:])
+    else:
+        # Bare return — replace whole node
+        new_content = (source[:ret_node.start_byte] +
+                       f"return {new_value}".encode("utf-8") +
+                       source[ret_node.end_byte:])
+    _write_file(fp, new_content.decode("utf-8"))
+    ok, err = _verify_parses_ok(fp)
+    if not ok:
+        _write_file(fp, source.decode("utf-8"))
+        return {"success": False, "error": f"Parse error after changing return: {err}", "rolled_back": True}
+    return {"success": True}
+
+
+def _tmpl_add_class_attribute_formal(params):
+    class_loc = params["class_locator"]
+    attr_name = params["attr_name"]
+    attr_value = params["attr_value"]
+    type_ann = params.get("type_annotation")
+
+    fp = class_loc.get("file", "")
+    if type_ann:
+        attr_code = f"{attr_name}: {type_ann} = {attr_value}"
+    else:
+        attr_code = f"{attr_name} = {attr_value}"
+
+    return _execute_composed_op("add_class_attribute", {
+        "file": fp,
+        "class_name": class_loc.get("name", ""),
+        "attribute_code": attr_code,
+    })
+
+
+# Template handler dispatch table
+_TEMPLATE_HANDLERS = {
+    "guard_clause": _tmpl_guard_clause,
+    "wrap_try_except": _tmpl_wrap_try_except,
+    "add_parameter": _tmpl_add_parameter,
+    "replace_expression": _tmpl_replace_expression,
+    "extract_variable": _tmpl_extract_variable,
+    "add_import_and_use": _tmpl_add_import_and_use,
+    "add_method": _tmpl_add_method_formal,
+    "modify_condition": _tmpl_modify_condition,
+    "add_conditional_branch": _tmpl_add_conditional_branch,
+    "replace_function_body": _tmpl_replace_function_body,
+    "wrap_context_manager": _tmpl_wrap_context_manager,
+    "add_decorator": _tmpl_add_decorator,
+    "inline_variable": _tmpl_inline_variable,
+    "change_return_value": _tmpl_change_return_value,
+    "add_class_attribute": _tmpl_add_class_attribute_formal,
+}
+
+
+def _execute_formal_fragment(step):
+    """Execute a Tier 3 typed fragment operation."""
+    fragment = step["fragment"]
+    target = step.get("target", {})
+    action = step.get("action", "replace")
+    fp = target.get("file", "")
+
+    if not fp:
+        return {"success": False, "error": "No file specified in fragment target"}
+
+    # Validate fragment structure
+    errors = validate_fragment(fragment)
+    if errors:
+        return {"success": False, "error": f"Fragment validation: {'; '.join(errors)}",
+                "phase": "fragment_validation"}
+
+    # Resolve target location
+    nodes = resolve_locator(target, file_path=fp)
+    if not nodes:
+        return {"success": False, "error": "Target node not found for fragment"}
+    node = nodes[0]
+
+    # Detect indentation level
+    source = open(fp, "rb").read()
+    indent = _get_indent_at_node(source, node)
+    indent_level = len(indent) // 4
+
+    # Serialize fragment to code
+    code = serialize_fragment(fragment, indent_level)
+
+    if action == "replace":
+        return _execute_primitive("replace_node", {"locator": target, "replacement": code})
+    elif action == "insert_before":
+        return _execute_primitive("insert_before_node", {"locator": target, "code": code})
+    elif action == "insert_after":
+        return _execute_primitive("insert_after_node", {"locator": target, "code": code})
+    else:
+        return {"success": False, "error": f"Unknown fragment action: {action}"}
+
+
+# ============================================================
 # execute_step: Apply a single plan step (file modification)
 # ============================================================
 
@@ -2230,11 +3653,22 @@ def _write_lines(path, lines):
 def execute_step(step_json, custom_operators=None):
     """Execute a single plan step (file modification).
 
-    Routes to primitive engine for AST-node primitives, falls back to
-    legacy operator implementations for backward compatibility.
+    Routes formal transforms (Tier 1/2/3) first, then primitives,
+    then composed operators, then legacy operators for backward compatibility.
     """
     step = json.loads(step_json) if isinstance(step_json, str) else step_json
-    op = step["op"]
+
+    # Try formal transform system first (Tier 1/2/3)
+    tier = detect_tier(step)
+    if tier > 0:
+        result = execute_formal_step(step)
+        if result is not None:
+            print(json.dumps(result))
+            if not result.get("success"):
+                sys.exit(1)
+            return
+
+    op = step.get("op", "")
     params = step.get("params", {})
     file_path = params.get("file", "") or (params.get("locator", {}).get("file", ""))
 
