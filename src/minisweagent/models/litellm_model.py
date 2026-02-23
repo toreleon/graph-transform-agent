@@ -22,6 +22,101 @@ from minisweagent.models.utils.retry import retry
 
 logger = logging.getLogger("litellm_model")
 
+# Fields from model_dump() that are safe to pass through to the API.
+# Litellm-internal fields (e.g., provider_specific_fields) are stripped.
+_KNOWN_MESSAGE_FIELDS = {
+    "role", "content", "name", "tool_calls", "tool_call_id", "function_call",
+    "refusal", "audio", "annotations",
+}
+
+# Roles accepted by the OpenAI chat completions API.
+# Messages with other roles (e.g., "exit") are internal to mini-swe-agent
+# and must be filtered before sending to the API.  The OpenAI SDK's Pydantic
+# Union discriminator serializes unrecognised roles as ``null``, which causes
+# "Invalid type for 'messages[N]': expected an object, but got null" errors.
+_VALID_API_ROLES = {"system", "user", "assistant", "tool", "function", "developer"}
+
+
+def _diagnose_null_messages(messages: list) -> None:
+    """Log diagnostic info when a null-message BadRequestError occurs."""
+    import json as _json
+
+    logger.error("=== NULL MESSAGE DIAGNOSTIC ===")
+    logger.error("Total messages: %d", len(messages))
+    for i, msg in enumerate(messages):
+        if msg is None:
+            logger.error("  messages[%d] = NULL", i)
+        elif not isinstance(msg, dict):
+            logger.error("  messages[%d] = type=%s value=%r", i, type(msg).__name__, msg)
+        else:
+            role = msg.get("role", "<missing>")
+            has_content = "content" in msg
+            content_val = msg.get("content")
+            content_repr = repr(content_val)[:80] if content_val is not None else "null"
+            keys = sorted(msg.keys())
+            logger.error(
+                "  messages[%d] = role=%s, has_content=%s, content=%s, keys=%s",
+                i, role, has_content, content_repr, keys,
+            )
+    # Also dump the raw JSON to a temp file for inspection
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix="_null_msg_debug.json", delete=False, prefix="litellm_") as f:
+            _json.dump(messages, f, indent=2, default=str)
+            logger.error("Full messages dumped to: %s", f.name)
+    except Exception:
+        pass
+    logger.error("=== END DIAGNOSTIC ===")
+
+
+def _sanitize_message(msg: dict) -> dict:
+    """Clean a message dict for API submission.
+
+    - Strips the ``extra`` key (internal to mini-swe-agent).
+    - Strips unknown/litellm-internal keys (e.g., ``provider_specific_fields``).
+    - Removes keys whose value is ``None`` **except** ``content`` (which is
+      legitimately ``None`` for assistant messages that only carry tool_calls).
+    - Deep-sanitizes ``tool_calls`` to remove Pydantic artifacts.
+    """
+    out: dict = {}
+    for k, v in msg.items():
+        if k == "extra":
+            continue
+        if k not in _KNOWN_MESSAGE_FIELDS:
+            continue
+        # Keep content even when None (valid for assistant tool_call messages)
+        if v is None and k != "content":
+            continue
+        out[k] = v
+    # Deep-sanitize tool_calls: strip None values and Pydantic internals
+    if "tool_calls" in out and isinstance(out["tool_calls"], list):
+        out["tool_calls"] = _sanitize_tool_calls(out["tool_calls"])
+    return out
+
+
+def _sanitize_tool_calls(tool_calls: list) -> list:
+    """Deep-clean tool_calls list for API submission.
+
+    Ensures each tool call is a plain dict with only known fields,
+    preventing Pydantic serialization artifacts from causing API errors.
+    """
+    _KNOWN_TC_FIELDS = {"id", "type", "function", "index"}
+    _KNOWN_FN_FIELDS = {"name", "arguments"}
+    cleaned = []
+    for tc in tool_calls:
+        if tc is None:
+            continue
+        if not isinstance(tc, dict):
+            # Convert Pydantic models to dicts
+            tc = tc.model_dump() if hasattr(tc, "model_dump") else dict(tc)
+        out = {k: v for k, v in tc.items() if k in _KNOWN_TC_FIELDS and v is not None}
+        # Ensure function sub-dict is also clean
+        fn = out.get("function")
+        if isinstance(fn, dict):
+            out["function"] = {k: v for k, v in fn.items() if k in _KNOWN_FN_FIELDS}
+        cleaned.append(out)
+    return cleaned
+
 
 class LitellmModelConfig(BaseModel):
     model_name: str
@@ -52,6 +147,7 @@ class LitellmModel:
         litellm.exceptions.PermissionDeniedError,
         litellm.exceptions.ContextWindowExceededError,
         litellm.exceptions.AuthenticationError,
+        litellm.exceptions.BadRequestError,
         KeyboardInterrupt,
     ]
 
@@ -61,6 +157,14 @@ class LitellmModel:
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
+        # Final defense: filter any null entries that slipped through
+        n_before = len(messages)
+        messages = [m for m in messages if m is not None and isinstance(m, dict)]
+        if len(messages) != n_before:
+            logger.warning(
+                "Filtered %d invalid entries from %d messages before API call",
+                n_before - len(messages), n_before,
+            )
         try:
             return litellm.completion(
                 model=self.config.model_name,
@@ -71,9 +175,21 @@ class LitellmModel:
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
             raise e
+        except litellm.exceptions.BadRequestError as e:
+            if "got null" in str(e):
+                _diagnose_null_messages(messages)
+            raise
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
-        prepared = [{k: v for k, v in msg.items() if k != "extra"} for msg in messages]
+        prepared = []
+        for msg in messages:
+            if msg is None:
+                continue
+            # Skip messages with non-API roles (e.g., "exit") — the OpenAI SDK
+            # serializes unrecognised roles as null, causing API errors.
+            if msg.get("role") not in _VALID_API_ROLES:
+                continue
+            prepared.append(_sanitize_message(msg))
         prepared = _reorder_anthropic_thinking_blocks(prepared)
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 

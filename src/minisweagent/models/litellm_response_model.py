@@ -28,14 +28,19 @@ class LitellmResponseModel(LitellmModel):
         """Flatten response objects into their output items for stateless API calls."""
         result = []
         for msg in messages:
+            if msg is None:
+                continue
             if msg.get("object") == "response":
                 for item in msg.get("output", []):
-                    result.append({k: v for k, v in item.items() if k != "extra"})
+                    if item is not None:
+                        result.append({k: v for k, v in item.items() if k != "extra"})
             else:
                 result.append({k: v for k, v in msg.items() if k != "extra"})
         return result
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
+        # Final defense: filter any null/invalid entries
+        messages = [m for m in messages if m is not None and isinstance(m, dict)]
         try:
             return litellm.responses(
                 model=self.config.model_name,
