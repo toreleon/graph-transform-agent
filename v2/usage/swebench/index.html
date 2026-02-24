@@ -3104,17 +3104,40 @@ For example, you could use</p>
         <span class="k">return</span> <span class="kc">None</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_parse_django_test_id</span><span class="p">(</span><span class="n">test_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Parse Django-style test ID like 'test_name (module.tests.ClassName)' into</span>
+<span class="sd">    a dotted path suitable for runtests.py: 'module.tests.ClassName.test_name'.</span>
+<span class="sd">    Returns None if test_id is not Django-style.</span>
+<span class="sd">    """</span>
+    <span class="n">m</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="sa">r</span><span class="s1">'^(\S+)\s+\(([^)]+)\)$'</span><span class="p">,</span> <span class="n">test_id</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">m</span><span class="p">:</span>
+        <span class="n">test_name</span><span class="p">,</span> <span class="n">module_path</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">m</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">module_path</span><span class="si">}</span><span class="s2">.</span><span class="si">{</span><span class="n">test_name</span><span class="si">}</span><span class="s2">"</span>
+    <span class="k">return</span> <span class="kc">None</span>
+
+
 <span class="k">def</span><span class="w"> </span><span class="nf">_run_single_test</span><span class="p">(</span><span class="n">env</span><span class="p">:</span> <span class="n">Environment</span><span class="p">,</span> <span class="n">test_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">120</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Run a single test in the environment. Returns True if passed."""</span>
+    <span class="n">django_path</span> <span class="o">=</span> <span class="n">_parse_django_test_id</span><span class="p">(</span><span class="n">test_id</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">django_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># Django uses its own test runner, not pytest</span>
+        <span class="n">command</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"cd /testbed &amp;&amp; python tests/runtests.py --settings=test_sqlite --parallel 1 -v 2 </span><span class="si">{</span><span class="n">django_path</span><span class="si">}</span><span class="s2"> 2&gt;&amp;1 | tail -30"</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">command</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"cd /testbed &amp;&amp; python -m pytest -xvs </span><span class="si">{</span><span class="n">test_id</span><span class="si">}</span><span class="s2"> 2&gt;&amp;1 | tail -20"</span>
+
     <span class="n">result</span> <span class="o">=</span> <span class="n">env</span><span class="o">.</span><span class="n">execute</span><span class="p">({</span>
-        <span class="s2">"command"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"cd /testbed &amp;&amp; python -m pytest -xvs </span><span class="si">{</span><span class="n">test_id</span><span class="si">}</span><span class="s2"> 2&gt;&amp;1 | tail -20"</span><span class="p">,</span>
+        <span class="s2">"command"</span><span class="p">:</span> <span class="n">command</span><span class="p">,</span>
         <span class="s2">"timeout"</span><span class="p">:</span> <span class="n">timeout</span><span class="p">,</span>
     <span class="p">})</span>
     <span class="n">output</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"output"</span><span class="p">,</span> <span class="s2">""</span><span class="p">)</span>
     <span class="n">rc</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"returncode"</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">rc</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
         <span class="k">return</span> <span class="kc">True</span>
-    <span class="k">if</span> <span class="s2">" passed"</span> <span class="ow">in</span> <span class="n">output</span> <span class="ow">and</span> <span class="s2">" failed"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">output</span> <span class="ow">and</span> <span class="s2">" error"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">output</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+    <span class="c1"># Fallback heuristic for pytest</span>
+    <span class="k">if</span> <span class="n">django_path</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="s2">" passed"</span> <span class="ow">in</span> <span class="n">output</span> <span class="ow">and</span> <span class="s2">" failed"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">output</span> <span class="ow">and</span> <span class="s2">" error"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">output</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+        <span class="k">return</span> <span class="kc">True</span>
+    <span class="c1"># Fallback heuristic for Django runner: "OK" at end means success</span>
+    <span class="k">if</span> <span class="n">django_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s1">'\bOK\b'</span><span class="p">,</span> <span class="n">output</span><span class="p">)</span> <span class="ow">and</span> <span class="s1">'FAILED'</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">output</span><span class="p">:</span>
         <span class="k">return</span> <span class="kc">True</span>
     <span class="k">return</span> <span class="kc">False</span>
 
