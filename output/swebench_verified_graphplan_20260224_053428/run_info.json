@@ -1,0 +1,11 @@
+{
+    "timestamp": "20260224_053428",
+    "config": "swebench_graphplan.yaml",
+    "split": "test",
+    "workers": 2,
+    "model": "null",
+    "slice": "null",
+    "filter": "null",
+    "command": "uv run mini-extra swebench --subset verified --split test -c swebench_graphplan.yaml -o output/swebench_verified_graphplan_20260224_053428 -w 2",
+    "git_commit": "72461a3"
+}

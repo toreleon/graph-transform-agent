@@ -247,17 +247,40 @@ def evaluate_submission(env: Environment, instance: dict, submission: str) -> di
         return None
 
 
+def _parse_django_test_id(test_id: str) -> str | None:
+    """Parse Django-style test ID like 'test_name (module.tests.ClassName)' into
+    a dotted path suitable for runtests.py: 'module.tests.ClassName.test_name'.
+    Returns None if test_id is not Django-style.
+    """
+    m = re.match(r'^(\S+)\s+\(([^)]+)\)$', test_id)
+    if m:
+        test_name, module_path = m.group(1), m.group(2)
+        return f"{module_path}.{test_name}"
+    return None
+
+
 def _run_single_test(env: Environment, test_id: str, timeout: int = 120) -> bool:
     """Run a single test in the environment. Returns True if passed."""
+    django_path = _parse_django_test_id(test_id)
+    if django_path is not None:
+        # Django uses its own test runner, not pytest
+        command = f"cd /testbed && python tests/runtests.py --settings=test_sqlite --parallel 1 -v 2 {django_path} 2>&1 | tail -30"
+    else:
+        command = f"cd /testbed && python -m pytest -xvs {test_id} 2>&1 | tail -20"
+
     result = env.execute({
-        "command": f"cd /testbed && python -m pytest -xvs {test_id} 2>&1 | tail -20",
+        "command": command,
         "timeout": timeout,
     })
     output = result.get("output", "")
     rc = result.get("returncode", -1)
     if rc == 0:
         return True
-    if " passed" in output and " failed" not in output and " error" not in output.lower():
+    # Fallback heuristic for pytest
+    if django_path is None and " passed" in output and " failed" not in output and " error" not in output.lower():
+        return True
+    # Fallback heuristic for Django runner: "OK" at end means success
+    if django_path is not None and re.search(r'\bOK\b', output) and 'FAILED' not in output:
         return True
     return False
 

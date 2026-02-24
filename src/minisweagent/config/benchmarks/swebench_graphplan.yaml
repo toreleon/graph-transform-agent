@@ -206,11 +206,10 @@ model:
 
     If you have completed your assignment, please consult the first message about how to
     submit your solution (you will not be able to continue working on this task after that).
-  model_name: "openai/gpt-5-mini"
+  model_name: "azure/gpt-5.2"
   cost_tracking: "ignore_errors"
   model_kwargs:
-    api_base: "http://localhost:4141/"
-    api_key: "dummy"
     drop_params: true
     temperature: 0.0
     parallel_tool_calls: true
+    tool_choice: "required"

@@ -203,7 +203,10 @@ class GraphPlanAgent(DefaultAgent):
             return self._verify_submission(self.messages[-1].get("extra", {}))
 
         if not plan_files:
-            return self._verify_submission(self._fallback_step_loop())
+            return self._verify_submission(self._fallback_step_loop(
+                reason="Exploration phase did not identify files to plan on. "
+                       "Please explore the codebase, find the relevant files, and fix the issue directly."
+            ))
 
         # Phase 2: Build graph + Generate plan + Verify + Execute
         try:
@@ -220,7 +223,9 @@ class GraphPlanAgent(DefaultAgent):
             return self._verify_submission(self.messages[-1].get("extra", {}))
 
         # If plan execution didn't submit, fall back to step loop
-        return self._verify_submission(self._fallback_step_loop())
+        return self._verify_submission(self._fallback_step_loop(
+            reason="Plan execution phase completed but did not produce a final submission."
+        ))
 
     def _install_treesitter(self):
         """Install tree-sitter-languages in the container if not already present.
@@ -327,15 +332,29 @@ class GraphPlanAgent(DefaultAgent):
         """
         # Track where messages start so we only scan new messages (not system/instance templates)
         msg_start_idx = len(self.messages)
+        consecutive_format_errors = 0
+        max_consecutive_format_errors = 3
 
         for step_num in range(self.config.max_explore_steps):
             try:
                 self.step()
+                consecutive_format_errors = 0  # Reset on successful step
             except InterruptAgentFlow as e:
                 self.add_messages(*e.messages)
                 # Check if this was a submission/exit
                 if self.messages[-1].get("role") == "exit":
                     return []
+                # Track consecutive format errors to avoid infinite loops
+                if any(m.get("extra", {}).get("interrupt_type") == "FormatError" for m in e.messages):
+                    consecutive_format_errors += 1
+                    if consecutive_format_errors >= max_consecutive_format_errors:
+                        logger.warning(
+                            f"Exploration: {consecutive_format_errors} consecutive format errors, "
+                            f"falling back to step loop"
+                        )
+                        return []
+                else:
+                    consecutive_format_errors = 0
                 # Otherwise continue exploring (e.g., FormatError)
 
             if self.messages[-1].get("role") == "exit":
@@ -821,14 +840,82 @@ class GraphPlanAgent(DefaultAgent):
             if self.messages[-1].get("role") == "exit":
                 break
 
-    def _fallback_step_loop(self) -> dict:
+    def _fallback_step_loop(self, reason: str = "") -> dict:
         """Continue with the normal DefaultAgent step loop for graceful degradation."""
         self._print_phase("FALLBACK", "standard step loop")
+
+        # Inject a clear directive so the LLM knows to work directly
+        fallback_msg = (
+            "The structured plan approach did not succeed. "
+            "Please continue working on the task using direct bash commands.\n\n"
+            "You can edit files directly using sed, perl, or python scripts. "
+            "Do NOT write to /tmp/edit_plan.json — just make the code changes directly.\n\n"
+            "When done:\n"
+            "1. Create patch: git diff -- <files> > patch.txt\n"
+            "2. Verify: cat patch.txt\n"
+            "3. Submit: echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt"
+        )
+        if reason:
+            fallback_msg = f"{reason}\n\n{fallback_msg}"
+        self.add_messages(self.model.format_message(role="user", content=fallback_msg))
+
+        consecutive_format_errors = 0
+        max_consecutive_format_errors = 5
+        recent_commands: list[str] = []
+        max_repetitions = 5  # abort if the same command appears this many times in last N commands
         while True:
             try:
                 self.step()
+                consecutive_format_errors = 0
+
+                # Detect repetitive commands (agent stuck in a loop)
+                last_msg = self.messages[-1] if self.messages else {}
+                if last_msg.get("role") == "tool":
+                    # Get the command from the preceding assistant message
+                    for m in reversed(self.messages[:-1]):
+                        if m.get("role") == "assistant":
+                            actions = m.get("extra", {}).get("actions", [])
+                            for a in actions:
+                                cmd = a.get("command", "").strip()[:200]
+                                if cmd:
+                                    recent_commands.append(cmd)
+                            break
+                    # Keep only last 20 commands
+                    recent_commands = recent_commands[-20:]
+                    # Check if the most recent command has been repeated too many times
+                    if recent_commands and recent_commands.count(recent_commands[-1]) >= max_repetitions:
+                        logger.warning(
+                            f"Fallback loop: command repeated {max_repetitions} times, "
+                            f"nudging agent to try a different approach"
+                        )
+                        self.add_messages(self.model.format_message(
+                            role="user",
+                            content=(
+                                "You seem to be repeating the same command. "
+                                "Please try a different approach to fix the issue. "
+                                "Edit the source file directly using sed or perl, "
+                                "then create the patch and submit."
+                            ),
+                        ))
+                        recent_commands.clear()
+
             except InterruptAgentFlow as e:
                 self.add_messages(*e.messages)
+                if any(m.get("extra", {}).get("interrupt_type") == "FormatError" for m in e.messages):
+                    consecutive_format_errors += 1
+                    if consecutive_format_errors >= max_consecutive_format_errors:
+                        logger.error(
+                            f"Fallback loop: {consecutive_format_errors} consecutive format errors, "
+                            f"aborting instance"
+                        )
+                        self.add_messages(self.model.format_message(
+                            role="exit",
+                            content="Too many consecutive format errors",
+                            extra={"exit_status": "FormatError", "submission": ""},
+                        ))
+                        break
+                else:
+                    consecutive_format_errors = 0
             except Exception as e:
                 self.handle_uncaught_exception(e)
                 raise
